@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: daytona-proxy
+    runtime: docker
+    rootDir: go
+    dockerfilePath: ./Dockerfile
+    dockerContext: ./
+    healthCheckPath: /health
+    plan: starter
+    region: oregon
+    domains:
+      - brainbaselabs.space
+    envVars:
+      - key: DAYTONA_API_KEY
+        sync: false
+      - key: DAYTONA_API_URL
+        value: https://app.daytona.io/api
