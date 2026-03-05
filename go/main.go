@@ -106,6 +106,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sandboxID, port := getSandboxIdAndPortFromUrl(r.Host)
+	log.Printf("Request: host=%s sandbox=%s port=%s", r.Host, sandboxID, port)
 	if err := validateInputs(sandboxID, port); err != nil {
 		log.Printf("Invalid request: %v", err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
