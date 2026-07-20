@@ -68,6 +68,16 @@ func TestPreviewIdFromHost(t *testing.T) {
 			host: "abc.brainbaselabs.space:443",
 			want: "abc",
 		},
+		{
+			name: "absolute (FQDN) host with trailing dot still matches",
+			host: "abc.brainbaselabs.space.",
+			want: "abc",
+		},
+		{
+			name: "absolute host with trailing dot and port",
+			host: "abc.brainbaselabs.space.:443",
+			want: "abc",
+		},
 	}
 
 	for _, tt := range tests {
@@ -78,6 +88,63 @@ func TestPreviewIdFromHost(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPreviewIdFromHostTrailingDotBaseDomain guards that a PREVIEW_BASE_DOMAIN
+// configured in absolute (trailing-dot) form still resolves ordinary hosts,
+// rather than rejecting every request because the suffix never matches.
+func TestPreviewIdFromHostTrailingDotBaseDomain(t *testing.T) {
+	if got := previewIdFromHost("abc.brainbaselabs.space", "brainbaselabs.space."); got != "abc" {
+		t.Errorf("previewIdFromHost with trailing-dot baseDomain = %q, want %q", got, "abc")
+	}
+}
+
+// TestResolveHonorsMasCacheTTL guards that the proxy caches a resolution for
+// the window mas dictates via cache_ttl_s, so revocation/expiry take effect
+// within that window instead of a fixed 2-minute lag.
+func TestResolveHonorsMasCacheTTL(t *testing.T) {
+	t.Run("honors mas cache_ttl_s", func(t *testing.T) {
+		p := newTestProxy(t, Resolved{UpstreamURL: "http://x", CacheTTLS: 10})
+		if _, err := p.resolve(context.Background(), "abc"); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		_, exp, found := p.cache.GetWithExpiration("abc")
+		if !found {
+			t.Fatal("expected resolution to be cached")
+		}
+		if ttl := time.Until(exp); ttl <= 0 || ttl > 20*time.Second {
+			t.Errorf("cache ttl = %v, want ~10s (honoring mas cache_ttl_s, not the 2m default)", ttl)
+		}
+	})
+
+	t.Run("falls back to default when mas omits cache_ttl_s", func(t *testing.T) {
+		p := newTestProxy(t, Resolved{UpstreamURL: "http://x"}) // CacheTTLS == 0
+		if _, err := p.resolve(context.Background(), "abc"); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		_, exp, found := p.cache.GetWithExpiration("abc")
+		if !found {
+			t.Fatal("expected resolution to be cached")
+		}
+		ttl := time.Until(exp)
+		if ttl <= 0 || ttl > defaultResolveCacheTTL+5*time.Second {
+			t.Errorf("cache ttl = %v, want ~%v (default)", ttl, defaultResolveCacheTTL)
+		}
+	})
+
+	t.Run("caps an oversized cache_ttl_s", func(t *testing.T) {
+		p := newTestProxy(t, Resolved{UpstreamURL: "http://x", CacheTTLS: 86400})
+		if _, err := p.resolve(context.Background(), "abc"); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		_, exp, found := p.cache.GetWithExpiration("abc")
+		if !found {
+			t.Fatal("expected resolution to be cached")
+		}
+		if ttl := time.Until(exp); ttl > maxResolveCacheTTL {
+			t.Errorf("cache ttl = %v, want <= %v (capped)", ttl, maxResolveCacheTTL)
+		}
+	})
 }
 
 func TestResolveMapsMas410ToResolveError(t *testing.T) {

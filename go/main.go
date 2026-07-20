@@ -45,7 +45,20 @@ type Resolved struct {
 	UpstreamURL string `json:"upstream_url"`
 	Token       string `json:"token"`
 	TokenHeader string `json:"token_header"`
+	// CacheTTLS is how long (seconds) mas permits this resolution to be
+	// cached. It bounds how stale a revoked/expired preview can stay
+	// reachable through the proxy, so we honor it instead of a fixed TTL.
+	CacheTTLS int `json:"cache_ttl_s"`
 }
+
+const (
+	// defaultResolveCacheTTL is used when mas omits cache_ttl_s (or sends <=0).
+	defaultResolveCacheTTL = 45 * time.Second
+	// maxResolveCacheTTL caps the proxy-side revocation lag regardless of what
+	// mas returns, so a bad/oversized cache_ttl_s can't keep a closed preview
+	// reachable for long.
+	maxResolveCacheTTL = 2 * time.Minute
+)
 
 // resolveError carries the HTTP status mas returned so callers can map it
 // to a branded error page (e.g. 404/410) instead of always answering 502.
@@ -74,7 +87,9 @@ func validateInputs(previewID string) error {
 
 func NewProxy(config *Config) *Proxy {
 	p := &Proxy{
-		cache:     cache.New(2*time.Minute, 5*time.Minute),
+		// Per-entry TTL is set explicitly from mas's cache_ttl_s in resolve();
+		// this default only applies if that is ever omitted.
+		cache:     cache.New(defaultResolveCacheTTL, 5*time.Minute),
 		config:    config,
 		apiClient: &http.Client{Timeout: 30 * time.Second},
 	}
@@ -200,7 +215,16 @@ func (p *Proxy) resolve(ctx context.Context, previewID string) (*Resolved, error
 		return nil, err
 	}
 
-	p.cache.Set(previewID, &r, cache.DefaultExpiration)
+	// Honor mas's cache_ttl_s so an expired/revoked preview stops resolving
+	// within that window instead of lingering for a fixed 2-minute default.
+	ttl := time.Duration(r.CacheTTLS) * time.Second
+	if ttl <= 0 {
+		ttl = defaultResolveCacheTTL
+	}
+	if ttl > maxResolveCacheTTL {
+		ttl = maxResolveCacheTTL
+	}
+	p.cache.Set(previewID, &r, ttl)
 	return &r, nil
 }
 
@@ -284,8 +308,13 @@ func previewIdFromHost(host, baseDomain string) string {
 	if i := strings.Index(host, ":"); i != -1 {
 		host = host[:i]
 	}
-	host = strings.ToLower(host)
-	suffix := "." + strings.ToLower(baseDomain)
+	// Normalize a single trailing dot (absolute/FQDN form, e.g.
+	// "abc.example.com.") off both host and configured domain, so an absolute
+	// Host header still matches and PREVIEW_BASE_DOMAIN="example.com." doesn't
+	// reject every otherwise-valid preview request.
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	baseDomain = strings.TrimSuffix(strings.ToLower(baseDomain), ".")
+	suffix := "." + baseDomain
 	if !strings.HasSuffix(host, suffix) {
 		return ""
 	}
