@@ -6,7 +6,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -82,13 +81,11 @@ func NewProxy(config *Config) *Proxy {
 
 	p.proxy = &httputil.ReverseProxy{
 		Director: p.director,
-		ModifyResponse: func(resp *http.Response) error {
-			if resp.StatusCode != http.StatusOK {
-				return p.serveErrorPage(resp, http.StatusBadGateway)
-			}
-
-			return nil
-		},
+		// No ModifyResponse: the upstream is the user's real app now that we
+		// resolve via mas and inject the token server-side, so its responses
+		// (redirects, 304s, its own 404/401/500 pages, etc.) pass through
+		// unchanged. Only transport-level failures (connection refused,
+		// timeout, bad host) are handled, via ErrorHandler below.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("Proxy error: %v", err)
 			p.writeErrorPage(w, http.StatusBadGateway)
@@ -96,16 +93,6 @@ func NewProxy(config *Config) *Proxy {
 	}
 
 	return p
-}
-
-func (p *Proxy) serveErrorPage(resp *http.Response, status int) error {
-	resp.Body.Close()
-	resp.StatusCode = status
-	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
-	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(errorPageHTML)))
-	resp.Header.Del("Content-Encoding")
-	resp.Body = io.NopCloser(strings.NewReader(errorPageHTML))
-	return nil
 }
 
 func (p *Proxy) writeErrorPage(w http.ResponseWriter, status int) {
