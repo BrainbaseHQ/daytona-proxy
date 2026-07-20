@@ -150,6 +150,66 @@ func TestProxyInjectsResolvedTokenHeaderProviderAgnostically(t *testing.T) {
 	}
 }
 
+// TestProxyDoesNotForwardMasSecretUpstream guards against the internal
+// PREVIEW_RESOLVE_SECRET (sent to mas as X-Internal-Secret) ever leaking to
+// the upstream user app. director() should only ever set the resolved
+// token/tokenHeader from mas's response, never the proxy's own resolve
+// credentials, on the outgoing upstream request.
+func TestProxyDoesNotForwardMasSecretUpstream(t *testing.T) {
+	const secret = "test-secret"
+
+	var upstreamHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Internal-Secret"); got != secret {
+			t.Errorf("mas received X-Internal-Secret = %q, want %q", got, secret)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Resolved{
+			UpstreamURL: upstream.URL,
+			Token:       "sandbox-tok",
+			TokenHeader: "X-Daytona-Preview-Token",
+		})
+	}))
+	defer mas.Close()
+
+	config := &Config{
+		MasBaseURL:           mas.URL,
+		PreviewResolveSecret: secret,
+		BaseDomain:           "preview.test",
+	}
+	proxy := NewProxy(config)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "abc.preview.test"
+	rec := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if upstreamHeaders == nil {
+		t.Fatal("upstream never received a request")
+	}
+
+	if got := upstreamHeaders.Get("X-Internal-Secret"); got != "" {
+		t.Errorf("upstream received X-Internal-Secret header = %q, want empty", got)
+	}
+	for name, values := range upstreamHeaders {
+		for _, v := range values {
+			if v == secret {
+				t.Errorf("upstream header %q carried the mas resolve secret verbatim: %q", name, v)
+			}
+		}
+	}
+}
+
 // TestProxyPassesNon200UpstreamResponsesThrough guards the fix for the
 // non-200-response-clobbering bug: now that mas resolve + server-side token
 // injection means the upstream is the user's real app, its redirects,

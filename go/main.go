@@ -167,6 +167,15 @@ func (p *Proxy) resolve(ctx context.Context, previewID string) (*Resolved, error
 		return x.(*Resolved), nil
 	}
 
+	// Bound the resolve call independently of the server's write deadline.
+	// http.Server.WriteTimeout (when set) covers the entire handler -
+	// resolve + the reverse-proxy round trip + response streaming - so a
+	// slow sandbox-wake resolve could otherwise eat the whole budget and
+	// truncate the real proxy response. 15s is comfortably enough for a
+	// wake without risking that.
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
 	body, _ := json.Marshal(map[string]string{"preview_id": previewID})
 	reqUrl := strings.TrimRight(p.config.MasBaseURL, "/") + "/internal/preview/resolve"
 	req, err := http.NewRequestWithContext(ctx, "POST", reqUrl, bytes.NewReader(body))
@@ -228,12 +237,19 @@ func main() {
 	proxy := NewProxy(config)
 
 	server := &http.Server{
-		Addr:           ":" + config.Port,
-		Handler:        proxy,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    120 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1 MB
+		Addr:        ":" + config.Port,
+		Handler:     proxy,
+		ReadTimeout: 30 * time.Second,
+		// No WriteTimeout: this is a streaming reverse proxy - long
+		// downloads, SSE, and slow-loading apps must not be cut off mid-
+		// response. The resolve() call has its own 15s context deadline, so
+		// a slow sandbox wake can't silently eat the response budget either.
+		// ReadHeaderTimeout below still protects against slowloris-style
+		// attacks on the read side.
+		WriteTimeout:      0,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
 	stop := make(chan os.Signal, 1)
