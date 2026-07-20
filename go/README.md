@@ -1,29 +1,48 @@
-# Daytona Proxy Server (Go)
+# Preview Proxy Server (Go)
 
-This is example of reverse proxy for the Daytona API. It dynamically routes requests to the correct sandbox preview URL based on the request's hostname, while also handling authentication and caching.
+This is a reverse proxy that routes preview traffic to the correct sandbox,
+provider-agnostically (Daytona and e2b). It parses an opaque preview ID from
+the request's hostname, resolves it to an upstream URL and auth token via
+[mas](https://github.com/brainbaselabs/brainbase-mas)'s
+`POST /internal/preview/resolve` endpoint, and injects the returned token on
+the way upstream.
 
 ## Features
 
-- **Dynamic Routing**: Parses sandbox ID and port from the request's hostname (e.g., `{port}-{sandbox-id}.{domain}`)
-- **Authentication**: Automatically fetches preview URL and auth token from the Daytona API and injects the `X-Daytona-Preview-Token` header
-- **Smart Caching**: In-memory caching (2 minutes) to reduce latency and API load
+- **Dynamic Routing**: Parses the preview ID from the request's hostname
+  (`{previewId}.{PREVIEW_BASE_DOMAIN}`)
+- **Provider-Agnostic Auth**: Resolves the upstream URL and auth token/header
+  via mas, then injects whatever header mas returns (e.g.
+  `X-Daytona-Preview-Token` or `e2b-traffic-access-token`)
+- **Smart Caching**: In-memory caching (2 minutes) of resolved previews to
+  reduce latency and load on mas
+- **Streaming-Safe**: No write deadline on the server, so long downloads, SSE,
+  and slow-loading apps are not cut off mid-response
 - **Production-Ready**: Graceful shutdown and proper error handling
-- **Input Validation**: Validation of sandbox IDs and ports with proper error responses
+- **Input Validation**: Validation of preview IDs with proper error responses
 - **Health Checks**: Built-in health check endpoint at `/health`
 - **Simple Configuration**: Minimal environment variables required
 
 ## Configuration
 
-The proxy is configured using environment variables. You can place these in a `.env` file in the project root.
+The proxy is configured using environment variables. You can place these in a
+`.env` file in the project root.
 
 ### Required Environment Variables
 
 ```bash
-# The base URL of your Daytona API instance
-DAYTONA_API_URL=https://app.daytona.io/api
+# The base URL of the brainbase-mas service (used to resolve opaque preview
+# ids to an upstream URL + auth token, provider-agnostically for Daytona and
+# e2b)
+MAS_BASE_URL=https://mas.brainbaselabs.com
 
-# Your Daytona API key (generate from the Daytona UI)
-DAYTONA_API_KEY=your-secret-api-key
+# Shared secret sent as X-Internal-Secret when calling mas's
+# POST /internal/preview/resolve endpoint
+PREVIEW_RESOLVE_SECRET=your-secret
+
+# The base domain previews are served under, e.g. requests to
+# {previewId}.<this> are resolved and proxied
+PREVIEW_BASE_DOMAIN=brainbaselabs.space
 ```
 
 ### Optional Environment Variables
@@ -51,15 +70,20 @@ To run the proxy server, execute the following command in the project root:
 go run main.go
 ```
 
-The server will start on the port specified in your `.env` file (or default to port 3000).
+The server will start on the port specified in your `.env` file (or default
+to port 3000).
 
 ## Deployment with Docker
 
-Using Docker is the recommended way to deploy the proxy as it creates a portable, consistent, and isolated environment. Environment variables are injected at runtime for security.
+Using Docker is the recommended way to deploy the proxy as it creates a
+portable, consistent, and isolated environment. Environment variables are
+injected at runtime for security.
 
 ### 1. Build the Docker Image
 
-From the project root, run the following command to build the Docker image. This will create a lightweight, production-ready image named `daytona-proxy`.
+From the project root, run the following command to build the Docker image.
+This will create a lightweight, production-ready image named
+`daytona-proxy`.
 
 ```sh
 docker build -t daytona-proxy .
@@ -67,12 +91,15 @@ docker build -t daytona-proxy .
 
 ### 2. Run the Docker Container
 
-Run the container with environment variables. This will start the proxy in the background, map the internal port `3000` to the host's port `3000`, and automatically restart it if it fails.
+Run the container with environment variables. This will start the proxy in
+the background, map the internal port `3000` to the host's port `3000`, and
+automatically restart it if it fails.
 
 ```sh
 docker run -d --restart always -p 3000:3000 \
-  -e DAYTONA_API_URL="https://app.daytona.io/api" \
-  -e DAYTONA_API_KEY="your-secret-api-key" \
+  -e MAS_BASE_URL="https://mas.brainbaselabs.com" \
+  -e PREVIEW_RESOLVE_SECRET="your-secret" \
+  -e PREVIEW_BASE_DOMAIN="brainbaselabs.space" \
   -e PORT="3000" \
   --name daytona-proxy daytona-proxy
 ```

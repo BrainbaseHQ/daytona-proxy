@@ -10,7 +10,9 @@ services:
       - brainbaselabs.space
       - "*.brainbaselabs.space"
     envVars:
-      - key: DAYTONA_API_KEY
+      - key: MAS_BASE_URL
         sync: false
-      - key: DAYTONA_API_URL
-        value: https://app.daytona.io/api
+      - key: PREVIEW_RESOLVE_SECRET
+        sync: false
+      - key: PREVIEW_BASE_DOMAIN
+        value: brainbaselabs.space

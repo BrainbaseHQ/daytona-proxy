@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -22,9 +22,10 @@ import (
 )
 
 type Config struct {
-	DaytonaAPIURL string
-	DaytonaAPIKey string
-	Port          string
+	MasBaseURL           string
+	PreviewResolveSecret string
+	BaseDomain           string
+	Port                 string
 }
 
 //go:embed error.html
@@ -37,21 +38,48 @@ type Proxy struct {
 	config    *Config
 }
 
-var (
-	sandboxIDRegex = regexp.MustCompile(`^[a-zA-Z0-9-_]+$`)
-	portRegex      = regexp.MustCompile(`^[0-9]+$`)
-)
+var previewIDRegex = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
 
-type PreviewResponse struct {
-	URL   string `json:"url"`
-	Token string `json:"token"`
+// Resolved is the response from mas's POST /internal/preview/resolve.
+type Resolved struct {
+	UpstreamURL string `json:"upstream_url"`
+	Token       string `json:"token"`
+	TokenHeader string `json:"token_header"`
+	// CacheTTLS is how long (seconds) mas permits this resolution to be
+	// cached. It bounds how stale a revoked/expired preview can stay
+	// reachable through the proxy, so we honor it instead of a fixed TTL.
+	CacheTTLS int `json:"cache_ttl_s"`
 }
 
-func validateInputs(sandboxID, port string) error {
-	if sandboxID == "" || port == "" {
-		return fmt.Errorf("sandbox ID and port cannot be empty")
+const (
+	// defaultResolveCacheTTL is used when mas omits cache_ttl_s (or sends <=0).
+	defaultResolveCacheTTL = 45 * time.Second
+	// maxResolveCacheTTL caps the proxy-side revocation lag regardless of what
+	// mas returns, so a bad/oversized cache_ttl_s can't keep a closed preview
+	// reachable for long.
+	maxResolveCacheTTL = 2 * time.Minute
+)
+
+// resolveError carries the HTTP status mas returned so callers can map it
+// to a branded error page (e.g. 404/410) instead of always answering 502.
+type resolveError struct {
+	status int
+}
+
+func (e *resolveError) Error() string {
+	return fmt.Sprintf("mas resolve returned status %d", e.status)
+}
+
+// contextKey avoids collisions with other packages' context keys.
+type contextKey int
+
+const resolvedContextKey contextKey = iota
+
+func validateInputs(previewID string) error {
+	if previewID == "" {
+		return fmt.Errorf("preview ID cannot be empty")
 	}
-	if !sandboxIDRegex.MatchString(sandboxID) || !portRegex.MatchString(port) {
+	if !previewIDRegex.MatchString(previewID) {
 		return fmt.Errorf("invalid format")
 	}
 	return nil
@@ -59,42 +87,32 @@ func validateInputs(sandboxID, port string) error {
 
 func NewProxy(config *Config) *Proxy {
 	p := &Proxy{
-		cache:     cache.New(2*time.Minute, 5*time.Minute),
+		// Per-entry TTL is set explicitly from mas's cache_ttl_s in resolve();
+		// this default only applies if that is ever omitted.
+		cache:     cache.New(defaultResolveCacheTTL, 5*time.Minute),
 		config:    config,
-		apiClient: &http.Client{Timeout: 10 * time.Second},
+		apiClient: &http.Client{Timeout: 30 * time.Second},
 	}
 
 	p.proxy = &httputil.ReverseProxy{
 		Director: p.director,
-		ModifyResponse: func(resp *http.Response) error {
-			if resp.StatusCode != http.StatusOK {
-				return p.serveErrorPage(resp)
-			}
-
-			return nil
-		},
+		// No ModifyResponse: the upstream is the user's real app now that we
+		// resolve via mas and inject the token server-side, so its responses
+		// (redirects, 304s, its own 404/401/500 pages, etc.) pass through
+		// unchanged. Only transport-level failures (connection refused,
+		// timeout, bad host) are handled, via ErrorHandler below.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("Proxy error: %v", err)
-			p.writeErrorPage(w)
+			p.writeErrorPage(w, http.StatusBadGateway)
 		},
 	}
 
 	return p
 }
 
-func (p *Proxy) serveErrorPage(resp *http.Response) error {
-	resp.Body.Close()
-	resp.StatusCode = http.StatusBadGateway
-	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
-	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(errorPageHTML)))
-	resp.Header.Del("Content-Encoding")
-	resp.Body = io.NopCloser(strings.NewReader(errorPageHTML))
-	return nil
-}
-
-func (p *Proxy) writeErrorPage(w http.ResponseWriter) {
+func (p *Proxy) writeErrorPage(w http.ResponseWriter, status int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusBadGateway)
+	w.WriteHeader(status)
 	w.Write([]byte(errorPageHTML))
 }
 
@@ -105,28 +123,42 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sandboxID, port := getSandboxIdAndPortFromUrl(r.Host)
-	log.Printf("Request: host=%s sandbox=%s port=%s", r.Host, sandboxID, port)
-	if err := validateInputs(sandboxID, port); err != nil {
+	previewID := previewIdFromHost(r.Host, p.config.BaseDomain)
+	log.Printf("Request: host=%s previewId=%s", r.Host, previewID)
+	if err := validateInputs(previewID); err != nil {
 		log.Printf("Invalid request: %v", err)
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		p.writeErrorPage(w, http.StatusNotFound)
 		return
 	}
 
-	p.proxy.ServeHTTP(w, r)
+	// Resolve up front so we can map mas errors (404/410) to the correct
+	// status on the branded error page. Upstream/proxy failures after this
+	// point stay 502 (handled by ModifyResponse/ErrorHandler).
+	resolved, err := p.resolve(r.Context(), previewID)
+	if err != nil {
+		if rerr, ok := err.(*resolveError); ok && (rerr.status == http.StatusNotFound || rerr.status == http.StatusGone) {
+			log.Printf("previewId %s unresolvable: %v", previewID, err)
+			p.writeErrorPage(w, rerr.status)
+			return
+		}
+		log.Printf("Failed to resolve previewId %s: %v", previewID, err)
+		p.writeErrorPage(w, http.StatusBadGateway)
+		return
+	}
+
+	ctx := context.WithValue(r.Context(), resolvedContextKey, resolved)
+	p.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (p *Proxy) director(req *http.Request) {
-	sandboxId, port := getSandboxIdAndPortFromUrl(req.Host)
-
-	preview, err := p.getPreview(req.Context(), sandboxId, port)
-	if err != nil {
-		log.Printf("Failed to get preview: %v", err)
+	resolved, ok := req.Context().Value(resolvedContextKey).(*Resolved)
+	if !ok || resolved == nil {
+		log.Printf("director: no resolved target in context")
 		req.URL.Host = "invalid.local"
 		return
 	}
 
-	targetUrl, err := url.Parse(preview.URL)
+	targetUrl, err := url.Parse(resolved.UpstreamURL)
 	if err != nil {
 		log.Printf("Invalid target URL: %v", err)
 		req.URL.Host = "invalid.local"
@@ -137,22 +169,36 @@ func (p *Proxy) director(req *http.Request) {
 	req.URL.Host = targetUrl.Host
 	req.URL.Path = singleJoiningSlash(targetUrl.Path, req.URL.Path)
 	req.Host = targetUrl.Host
-	req.Header.Set("X-Daytona-Preview-Token", preview.Token)
+	if resolved.Token != "" && resolved.TokenHeader != "" {
+		req.Header.Set(resolved.TokenHeader, resolved.Token) // e.g. x-daytona-preview-token OR e2b-traffic-access-token
+	}
 }
 
-func (p *Proxy) getPreview(ctx context.Context, sandboxId, port string) (*PreviewResponse, error) {
-	cacheKey := fmt.Sprintf("%s-%s", sandboxId, port)
-
-	if x, found := p.cache.Get(cacheKey); found {
-		return x.(*PreviewResponse), nil
+// resolve calls mas's POST /internal/preview/resolve to turn an opaque
+// previewId into an upstream URL + auth token/header, provider-agnostically
+// (Daytona and e2b both flow through this). Results are cached by previewId.
+func (p *Proxy) resolve(ctx context.Context, previewID string) (*Resolved, error) {
+	if x, found := p.cache.Get(previewID); found {
+		return x.(*Resolved), nil
 	}
 
-	apiUrl := fmt.Sprintf("%s/sandbox/%s/ports/%s/preview-url", p.config.DaytonaAPIURL, sandboxId, port)
-	req, err := http.NewRequestWithContext(ctx, "GET", apiUrl, nil)
+	// Bound the resolve call independently of the server's write deadline.
+	// http.Server.WriteTimeout (when set) covers the entire handler -
+	// resolve + the reverse-proxy round trip + response streaming - so a
+	// slow sandbox-wake resolve could otherwise eat the whole budget and
+	// truncate the real proxy response. 15s is comfortably enough for a
+	// wake without risking that.
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	body, _ := json.Marshal(map[string]string{"preview_id": previewID})
+	reqUrl := strings.TrimRight(p.config.MasBaseURL, "/") + "/internal/preview/resolve"
+	req, err := http.NewRequestWithContext(ctx, "POST", reqUrl, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.config.DaytonaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Secret", p.config.PreviewResolveSecret)
 
 	resp, err := p.apiClient.Do(req)
 	if err != nil {
@@ -161,16 +207,25 @@ func (p *Proxy) getPreview(ctx context.Context, sandboxId, port string) (*Previe
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+		return nil, &resolveError{status: resp.StatusCode}
 	}
 
-	var preview PreviewResponse
-	if err := json.NewDecoder(resp.Body).Decode(&preview); err != nil {
+	var r Resolved
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return nil, err
 	}
 
-	p.cache.Set(cacheKey, &preview, cache.DefaultExpiration)
-	return &preview, nil
+	// Honor mas's cache_ttl_s so an expired/revoked preview stops resolving
+	// within that window instead of lingering for a fixed 2-minute default.
+	ttl := time.Duration(r.CacheTTLS) * time.Second
+	if ttl <= 0 {
+		ttl = defaultResolveCacheTTL
+	}
+	if ttl > maxResolveCacheTTL {
+		ttl = maxResolveCacheTTL
+	}
+	p.cache.Set(previewID, &r, ttl)
+	return &r, nil
 }
 
 func loadConfig() *Config {
@@ -179,17 +234,22 @@ func loadConfig() *Config {
 	}
 
 	config := &Config{
-		DaytonaAPIURL: os.Getenv("DAYTONA_API_URL"),
-		DaytonaAPIKey: os.Getenv("DAYTONA_API_KEY"),
-		Port:          os.Getenv("PORT"),
+		MasBaseURL:           os.Getenv("MAS_BASE_URL"),
+		PreviewResolveSecret: os.Getenv("PREVIEW_RESOLVE_SECRET"),
+		BaseDomain:           os.Getenv("PREVIEW_BASE_DOMAIN"),
+		Port:                 os.Getenv("PORT"),
 	}
 
 	if config.Port == "" {
 		config.Port = "3000"
 	}
 
-	if config.DaytonaAPIURL == "" || config.DaytonaAPIKey == "" {
-		log.Fatal("DAYTONA_API_URL and DAYTONA_API_KEY must be set")
+	if config.BaseDomain == "" {
+		config.BaseDomain = "brainbaselabs.space"
+	}
+
+	if config.MasBaseURL == "" || config.PreviewResolveSecret == "" {
+		log.Fatal("MAS_BASE_URL and PREVIEW_RESOLVE_SECRET must be set")
 	}
 
 	return config
@@ -201,12 +261,19 @@ func main() {
 	proxy := NewProxy(config)
 
 	server := &http.Server{
-		Addr:           ":" + config.Port,
-		Handler:        proxy,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    120 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1 MB
+		Addr:        ":" + config.Port,
+		Handler:     proxy,
+		ReadTimeout: 30 * time.Second,
+		// No WriteTimeout: this is a streaming reverse proxy - long
+		// downloads, SSE, and slow-loading apps must not be cut off mid-
+		// response. The resolve() call has its own 15s context deadline, so
+		// a slow sandbox wake can't silently eat the response budget either.
+		// ReadHeaderTimeout below still protects against slowloris-style
+		// attacks on the read side.
+		WriteTimeout:      0,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -214,7 +281,8 @@ func main() {
 
 	go func() {
 		log.Printf("Starting proxy server on port %s", config.Port)
-		log.Printf("Daytona API URL: %s", config.DaytonaAPIURL)
+		log.Printf("mas base URL: %s", config.MasBaseURL)
+		log.Printf("Preview base domain: %s", config.BaseDomain)
 		log.Printf("Server ready to accept connections")
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -234,26 +302,27 @@ func main() {
 	}
 }
 
-func getSandboxIdAndPortFromUrl(host string) (string, string) {
-	if colonIndex := strings.Index(host, ":"); colonIndex != -1 {
-		host = host[:colonIndex]
+// previewIdFromHost returns the leftmost DNS label as the opaque preview id.
+// Host form: {previewId}.<baseDomain>. Empty string if it doesn't match.
+func previewIdFromHost(host, baseDomain string) string {
+	if i := strings.Index(host, ":"); i != -1 {
+		host = host[:i]
 	}
-
-	parts := strings.Split(host, ".")
-	if len(parts) < 1 {
-		return "", ""
+	// Normalize a single trailing dot (absolute/FQDN form, e.g.
+	// "abc.example.com.") off both host and configured domain, so an absolute
+	// Host header still matches and PREVIEW_BASE_DOMAIN="example.com." doesn't
+	// reject every otherwise-valid preview request.
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	baseDomain = strings.TrimSuffix(strings.ToLower(baseDomain), ".")
+	suffix := "." + baseDomain
+	if !strings.HasSuffix(host, suffix) {
+		return ""
 	}
-
-	subdomain := parts[0]
-	subdomainParts := strings.SplitN(subdomain, "-", 2)
-	if len(subdomainParts) != 2 {
-		return "", ""
+	label := strings.TrimSuffix(host, suffix)
+	if label == "" || strings.Contains(label, ".") {
+		return ""
 	}
-
-	port := subdomainParts[0]
-	sandboxId := subdomainParts[1]
-
-	return sandboxId, port
+	return label
 }
 
 func singleJoiningSlash(a, b string) string {
