@@ -9,14 +9,25 @@ PLATFORM_DOCS_HOME ?= $(HOME)/.cache/brainbase/platform-docs
 DOCS_REPO_SSH := git@github.com:BrainbaseHQ/brainbase-platform-docs.git
 DOCS_REPO_HTTPS := https://github.com/BrainbaseHQ/brainbase-platform-docs.git
 # brainbase-docs is not a dependency of this repo, so it has to come from
-# somewhere else. uvx runs it straight out of the docs checkout: no venv, no
+# somewhere else. This runs it straight out of the docs checkout: no venv, no
 # install step, and identical behaviour whether this repo is node, pip or uv.
 #
-# The alternatives all fail somewhere. `uv run brainbase-docs` resyncs the
-# repo's venv from its lockfile and drops anything not in it. `pip install -e`
-# hits PEP 668 on a Homebrew python3. And a bare `python` does not exist on
-# macOS at all.
-DOCS_RUN ?= uvx --from $(PLATFORM_DOCS) brainbase-docs
+# Every part of this is load-bearing:
+#   --no-project      without it, uv adopts THIS repo's pyproject and syncs its
+#                     venv -- in a uv repo that is a slow no-op, in a node repo
+#                     an error.
+#   --with-editable   NOT `uvx --from`, and not a plain `--with`. Both cache a
+#                     built copy keyed on the path, and the docs repo's version
+#                     never changes -- so a pull brings new code that uv keeps
+#                     ignoring. `uvx --reinstall` and `uv cache clean` do not
+#                     dislodge it. Editable resolves to the source every run.
+#                     Verified: the built copy served a generator two commits
+#                     stale while CI, which pip installs fresh, ran the new one.
+#
+# The other alternatives fail too: `uv run brainbase-docs` resyncs the repo venv
+# and drops the tool, `pip install -e` hits PEP 668 on a Homebrew python3, and a
+# bare `python` does not exist on macOS.
+DOCS_RUN ?= uv run --no-project --with-editable $(PLATFORM_DOCS) brainbase-docs
 
 .PHONY: docs-sync docs-manifest
 
