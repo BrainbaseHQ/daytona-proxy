@@ -8,7 +8,15 @@ PLATFORM_DOCS ?= ./platform-docs
 PLATFORM_DOCS_HOME ?= $(HOME)/.cache/brainbase/platform-docs
 DOCS_REPO_SSH := git@github.com:BrainbaseHQ/brainbase-platform-docs.git
 DOCS_REPO_HTTPS := https://github.com/BrainbaseHQ/brainbase-platform-docs.git
-DOCS_RUN ?= python -m brainbase_docs.cli
+# brainbase-docs is not a dependency of this repo, so it has to come from
+# somewhere else. uvx runs it straight out of the docs checkout: no venv, no
+# install step, and identical behaviour whether this repo is node, pip or uv.
+#
+# The alternatives all fail somewhere. `uv run brainbase-docs` resyncs the
+# repo's venv from its lockfile and drops anything not in it. `pip install -e`
+# hits PEP 668 on a Homebrew python3. And a bare `python` does not exist on
+# macOS at all.
+DOCS_RUN ?= uvx --from $(PLATFORM_DOCS) brainbase-docs
 
 .PHONY: docs-sync docs-manifest
 
@@ -44,10 +52,14 @@ docs-sync:
 docs-manifest: docs-sync
 	@$(DOCS_RUN) --help >/dev/null 2>&1 || { \
 	  echo ""; \
-	  echo "  brainbase-docs is not installed in this environment."; \
-	  echo "  Install it from the checkout docs-sync just made:"; \
+	  echo "  Could not run brainbase-docs via:"; \
+	  echo "      $(DOCS_RUN)"; \
 	  echo ""; \
-	  echo "      pip install -e $(PLATFORM_DOCS)"; \
+	  echo "  This needs uv. Install it:"; \
+	  echo "      curl -LsSf https://astral.sh/uv/install.sh | sh"; \
+	  echo ""; \
+	  echo "  Or point DOCS_RUN at your own install:"; \
+	  echo "      make docs-manifest DOCS_RUN=\"python3 -m brainbase_docs.cli\""; \
 	  echo ""; \
 	  exit 1; }
 	$(DOCS_RUN) manifest --registry $(PLATFORM_DOCS)/registry.yaml
