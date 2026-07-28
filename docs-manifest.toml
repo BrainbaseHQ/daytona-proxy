@@ -1,0 +1,9 @@
+# Consumed by `brainbase-docs manifest` (BrainbaseHQ/brainbase-platform-docs).
+# No [introspect] section: routes and MCP tools are not captured for this
+# repo yet. Add app_import or mcp_import to enable runtime introspection.
+
+[service]
+name = "daytona-proxy"
+repo = "BrainbaseHQ/daytona-proxy"
+language = "unknown"
+platform = "render"
