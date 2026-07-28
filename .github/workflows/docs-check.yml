@@ -1,0 +1,35 @@
+# Checks this repo's generated docs against the platform docs corpus.
+#
+# Advisory: it comments on the PR, it does not block. Two layers —
+#   L1  the generated docs/service.yaml and AGENTS.md block are out of date.
+#       Mechanical, no false positives, fixed by `make docs-manifest`.
+#   L2  which platform pages claim the files this PR touched. A prompt to
+#       check, not an assertion that anything is wrong.
+#
+# Source: BrainbaseHQ/brainbase-platform-docs/.github/workflows/docs-check.yml
+name: docs-check
+
+on:
+  pull_request:
+  # Push-to-main runs L1 only. The L2 and comment steps are guarded on
+  # `github.event_name == 'pull_request'` in the reusable workflow, so on a
+  # merge commit they skip rather than calling the comment API with no PR
+  # number. The value of running here is catching manifest drift that reached
+  # main without a PR.
+  push:
+    branches: [main]
+
+# Declared here rather than left to the org default. A reusable workflow can
+# only reduce what its caller grants, so if the org default is read-only the
+# PR comment silently fails with a 403.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  docs:
+    uses: BrainbaseHQ/brainbase-platform-docs/.github/workflows/docs-check.yml@main
+    with:
+      repo_name: daytona-proxy
+    secrets:
+      DOCS_REPO_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
