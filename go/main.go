@@ -342,6 +342,15 @@ func cleanRequestPath(p string) string {
 		return "/"
 	}
 	hadTrailingSlash := strings.HasSuffix(p, "/")
+	// A path whose final segment is "." or ".." names a directory just as a
+	// trailing slash does, so "/docs/." must forward as "/docs/" and not
+	// "/docs". Upstreams that distinguish the two would otherwise route the
+	// request differently from what the caller asked for.
+	if !hadTrailingSlash {
+		if base := stdpath.Base(p); base == "." || base == ".." {
+			hadTrailingSlash = true
+		}
+	}
 	cleaned := stdpath.Clean(p)
 	if !strings.HasPrefix(cleaned, "/") {
 		cleaned = "/" + cleaned

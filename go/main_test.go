@@ -353,6 +353,9 @@ func TestCleanRequestPathResolvesTraversal(t *testing.T) {
 		{"traversal above root is clamped", "/../../etc/passwd", "/etc/passwd"},
 		{"repeated traversal is clamped", "/a/../../../b", "/b"},
 		{"dots inside a name are untouched", "/a..b/c", "/a..b/c"},
+		{"terminal dot keeps directory semantics", "/docs/.", "/docs/"},
+		{"terminal parent keeps directory semantics", "/docs/sub/..", "/docs/"},
+		{"terminal parent at root stays root", "/docs/..", "/"},
 		{"dotfile is untouched", "/.env", "/.env"},
 		{"relative path is absolutised", "app/index.html", "/app/index.html"},
 	}
@@ -403,6 +406,16 @@ func TestDirectorCannotEscapeUpstreamBasePath(t *testing.T) {
 			}
 			if strings.Contains(req.URL.Path, "..") {
 				t.Fatalf("forwarded path %q still contains a traversal segment", req.URL.Path)
+			}
+			// RawPath must be cleared, or the original escaped form is what
+			// actually goes on the wire when the URL is re-encoded. Asserting
+			// only on URL.Path would let the safeguard be deleted silently.
+			if req.URL.RawPath != "" {
+				t.Fatalf("RawPath %q survived; the escaped form would be sent instead", req.URL.RawPath)
+			}
+			if escaped := req.URL.EscapedPath(); !strings.HasPrefix(escaped, base) ||
+				strings.Contains(escaped, "..") || strings.Contains(strings.ToLower(escaped), "%2e") {
+				t.Fatalf("serialized path %q escaped the upstream base or kept a traversal", escaped)
 			}
 		})
 	}
