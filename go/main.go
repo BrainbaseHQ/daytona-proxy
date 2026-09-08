@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	stdpath "path"
 	"regexp"
 	"strings"
 	"syscall"
@@ -167,7 +168,13 @@ func (p *Proxy) director(req *http.Request) {
 
 	req.URL.Scheme = targetUrl.Scheme
 	req.URL.Host = targetUrl.Host
-	req.URL.Path = singleJoiningSlash(targetUrl.Path, req.URL.Path)
+	// Clean the client-supplied path before joining. Cloudflare sandbox upstreams
+	// carry the sandbox id and the port in the path rather than the host, so an
+	// unresolved ".." here would let a preview link reach a different port, or a
+	// different sandbox, on the same upstream. Clearing RawPath stops the
+	// original escaped form reasserting itself when the URL is re-encoded.
+	req.URL.Path = singleJoiningSlash(targetUrl.Path, cleanRequestPath(req.URL.Path))
+	req.URL.RawPath = ""
 	req.Host = targetUrl.Host
 	if resolved.Token != "" && resolved.TokenHeader != "" {
 		req.Header.Set(resolved.TokenHeader, resolved.Token) // e.g. x-daytona-preview-token OR e2b-traffic-access-token
@@ -323,6 +330,26 @@ func previewIdFromHost(host, baseDomain string) string {
 		return ""
 	}
 	return label
+}
+
+// cleanRequestPath resolves "." and ".." within a client-supplied path so it
+// cannot escape the upstream base it is about to be joined onto. Traversal above
+// the root is clamped at the root rather than rejected, which keeps ordinary
+// requests working while making escape impossible. A trailing slash is
+// preserved because some upstreams distinguish a directory from a file.
+func cleanRequestPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	hadTrailingSlash := strings.HasSuffix(p, "/")
+	cleaned := stdpath.Clean(p)
+	if !strings.HasPrefix(cleaned, "/") {
+		cleaned = "/" + cleaned
+	}
+	if hadTrailingSlash && cleaned != "/" {
+		cleaned += "/"
+	}
+	return cleaned
 }
 
 func singleJoiningSlash(a, b string) string {
