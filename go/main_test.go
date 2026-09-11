@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -329,4 +330,93 @@ func TestProxyPassesNon200UpstreamResponsesThrough(t *testing.T) {
 			t.Errorf("body = %q, want %q (i.e. NOT the branded error page)", got, appBody)
 		}
 	})
+}
+
+// TestCleanRequestPathResolvesTraversal covers the path-cleaning guard directly.
+//
+// Cloudflare sandbox upstreams put the sandbox id and the port in the path
+// rather than the host, so a "..", bare or percent-encoded, would otherwise let
+// a shared preview link reach a different port or a different sandbox on the
+// same upstream.
+func TestCleanRequestPathResolvesTraversal(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain path is unchanged", "/app/index.html", "/app/index.html"},
+		{"root stays root", "/", "/"},
+		{"empty becomes root", "", "/"},
+		{"trailing slash is preserved", "/app/", "/app/"},
+		{"single dot is removed", "/app/./index.html", "/app/index.html"},
+		{"parent segment is resolved", "/app/sub/../index.html", "/app/index.html"},
+		{"traversal above root is clamped", "/../../etc/passwd", "/etc/passwd"},
+		{"repeated traversal is clamped", "/a/../../../b", "/b"},
+		{"dots inside a name are untouched", "/a..b/c", "/a..b/c"},
+		{"terminal dot keeps directory semantics", "/docs/.", "/docs/"},
+		{"terminal parent keeps directory semantics", "/docs/sub/..", "/docs/"},
+		{"terminal parent at root stays root", "/docs/..", "/"},
+		{"dotfile is untouched", "/.env", "/.env"},
+		{"relative path is absolutised", "app/index.html", "/app/index.html"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cleanRequestPath(tc.in); got != tc.want {
+				t.Fatalf("cleanRequestPath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDirectorCannotEscapeUpstreamBasePath is the property that matters: whatever
+// the client sends, the forwarded path stays under the resolved upstream path.
+func TestDirectorCannotEscapeUpstreamBasePath(t *testing.T) {
+	const base = "/v1/sandbox/m-abc12345/port/8421"
+	p := newTestProxy(t, Resolved{
+		UpstreamURL: "https://bridge.example" + base,
+		Token:       "tok",
+		TokenHeader: "x-brainbase-sandbox-token",
+	})
+
+	// These are client paths as the proxy sees them: the preview host label has
+	// already been resolved to the upstream base, so what remains is whatever the
+	// caller put after the hostname.
+	hostile := []string{
+		"/../8422/admin",
+		"/../../m-other99/port/8421/",
+		"/%2e%2e/8422/admin",
+		"/a/../../../../etc/passwd",
+		"/app/../../../8422/",
+	}
+
+	for _, raw := range hostile {
+		t.Run(raw, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, raw, nil)
+			resolved, err := p.resolve(context.Background(), "preview-id")
+			if err != nil {
+				t.Fatalf("resolve failed: %v", err)
+			}
+			ctx := context.WithValue(req.Context(), resolvedContextKey, resolved)
+			req = req.WithContext(ctx)
+
+			p.director(req)
+
+			if !strings.HasPrefix(req.URL.Path, base) {
+				t.Fatalf("forwarded path %q escaped the upstream base %q", req.URL.Path, base)
+			}
+			if strings.Contains(req.URL.Path, "..") {
+				t.Fatalf("forwarded path %q still contains a traversal segment", req.URL.Path)
+			}
+			// RawPath must be cleared, or the original escaped form is what
+			// actually goes on the wire when the URL is re-encoded. Asserting
+			// only on URL.Path would let the safeguard be deleted silently.
+			if req.URL.RawPath != "" {
+				t.Fatalf("RawPath %q survived; the escaped form would be sent instead", req.URL.RawPath)
+			}
+			if escaped := req.URL.EscapedPath(); !strings.HasPrefix(escaped, base) ||
+				strings.Contains(escaped, "..") || strings.Contains(strings.ToLower(escaped), "%2e") {
+				t.Fatalf("serialized path %q escaped the upstream base or kept a traversal", escaped)
+			}
+		})
+	}
 }
