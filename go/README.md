@@ -11,6 +11,10 @@ the way upstream.
 
 - **Dynamic Routing**: Parses the preview ID from the request's hostname
   (`{previewId}.{PREVIEW_BASE_DOMAIN}`)
+- **Two Upstreams, One Wildcard**: A hyphen-free label is a sandbox preview id
+  and is resolved through mas as above. A hyphenated label names a published
+  Brainbase Interfaces dashboard and is forwarded to the Interfaces gateway
+  instead. See [Interfaces dashboards](#interfaces-dashboards)
 - **Provider-Agnostic Auth**: Resolves the upstream URL and auth token/header
   via mas, then injects whatever header mas returns (e.g.
   `X-Daytona-Preview-Token` or `e2b-traffic-access-token`)
@@ -48,9 +52,60 @@ PREVIEW_BASE_DOMAIN=brainbaselabs.space
 ### Optional Environment Variables
 
 ```bash
+# Where dashboard hosts are forwarded (see "Interfaces dashboards" below).
+# A bare origin, no path. Unset means this deployment serves no dashboards.
+INTERFACES_GATEWAY_URL=https://interfaces-gateway.internal
+
 # Server port (default: 3000)
 PORT=3000
 ```
+
+## Interfaces dashboards
+
+`*.{PREVIEW_BASE_DOMAIN}` carries two unrelated things, and the leftmost label
+says which.
+
+| label | example | upstream |
+| --- | --- | --- |
+| no hyphen | `b7f3a9c1.<domain>` | a sandbox preview, resolved through mas |
+| hyphenated | `ops-console.<domain>` | the Interfaces gateway |
+| hyphenated, `app--` prefix | `app--ops-console.<domain>` | the Interfaces gateway |
+
+The two sets cannot overlap. A preview id is validated against
+`^[a-zA-Z0-9]+$`, which has no hyphen, and brainbase-mas refuses to allocate a
+dashboard slug without one (`check_slug` in `src/interfaces/slugs.py`, for this
+exact reason). A dashboard has two hosts because the gateway's own page and the
+generated dashboard have to be different origins; they are siblings rather than
+nested because `*.<domain>` is a wildcard certificate and a wildcard matches
+exactly one label.
+
+Recognition is the slug grammar, not the presence of a hyphen: lowercase
+alphanumerics in hyphen-separated groups, at least two groups, no leading,
+trailing or doubled hyphen, 3 to 58 characters. So `_acme-challenge` and a
+punycode `xn--…` label are not dashboards and keep answering as they always
+have. A hyphenated *platform* host added under this domain in future would be
+captured, and has to be excluded here explicitly.
+
+Nothing is resolved on this side. The gateway already resolves every host it
+serves through mas and refuses one mas does not answer for, so an unknown
+dashboard host reaches the gateway and gets the gateway's own 404. A resolution
+here would be a second copy of that decision and a third round trip.
+
+The one thing the hop has to carry is the host the viewer asked for. `Host` is
+rewritten to the gateway, as it must be for the request to route there at all,
+so the viewer's host travels in `X-Forwarded-Host` - the header the gateway
+already reads, and the one thing it decides its role, its cookie scope and which
+interface is being asked for from. Because it decides access from that header,
+the value is **rebuilt** from the validated label plus the configured base
+domain rather than copied from the request, and `X-Forwarded-Host`,
+`X-Original-Host`, `X-Host` and `Forwarded` are all cleared first. A client that
+sends any of them cannot change which dashboard its request is checked against.
+
+The gateway reads that header under a name of its own
+(`INTERFACES_FORWARDED_HOST_HEADER`, default `x-forwarded-host`). Renaming it
+there without changing this proxy fails closed - the gateway falls back to
+`Host`, which is its own name, and refuses - but it also stops this proxy from
+overwriting what a client sent, so the two settings have to move together.
 
 ### Setup Instructions
 

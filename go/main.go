@@ -27,19 +27,81 @@ type Config struct {
 	PreviewResolveSecret string
 	BaseDomain           string
 	Port                 string
+	// InterfacesGatewayURL is where hosts that name a published Brainbase
+	// Interfaces dashboard are forwarded. Nil means this deployment serves no
+	// dashboards, and every such host is refused rather than guessed at.
+	InterfacesGatewayURL *url.URL
 }
 
 //go:embed error.html
 var errorPageHTML string
 
+//go:embed interface-error.html
+var interfaceErrorPageHTML string
+
 type Proxy struct {
-	proxy     *httputil.ReverseProxy
+	proxy *httputil.ReverseProxy
+	// gateway forwards dashboard hosts to the Interfaces gateway. A second
+	// ReverseProxy rather than a branch inside the first one: the preview
+	// director rewrites the path and injects a sandbox token, neither of which
+	// belongs on a request to the gateway, and one director doing both would be
+	// one function away from doing the wrong one.
+	gateway   *httputil.ReverseProxy
 	cache     *cache.Cache
 	apiClient *http.Client
 	config    *Config
 }
 
 var previewIDRegex = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
+
+// interfaceSlugRegex is the slug grammar brainbase-mas can actually allocate:
+// lowercase alphanumerics in hyphen-separated groups, at least two groups, no
+// leading, trailing or doubled hyphen. Kept in step with `check_slug` in
+// brainbase-mas `src/interfaces/slugs.py`, which is the only thing that mints a
+// slug, and with the database's `interfaces_slug_fmt_check`.
+//
+// Deliberately narrower than "the label contains a hyphen". A label is the whole
+// public namespace under the wildcard, so every byte this pattern accepts is a
+// byte the sandbox-preview path can never be given back. Two kinds of name
+// contain a hyphen and are not dashboards: an IDN/punycode label (`xn--…`, a
+// doubled hyphen in third and fourth position) and an underscore-prefixed
+// service record (`_acme-challenge`). Both are refused here and both keep
+// answering exactly as they do today, which is a 404.
+var interfaceSlugRegex = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)+$`)
+
+const (
+	// frameHostPrefix is the sibling label a dashboard's own document is served
+	// from: `app--<slug>` beside `<slug>`. A sibling and not a child because
+	// `*.brainbaselabs.space` is a wildcard certificate and a wildcard matches
+	// exactly one label.
+	frameHostPrefix = "app--"
+	// forwardedHostHeader carries the host the viewer asked for. The gateway
+	// decides its role, scopes its cookies and resolves which interface is being
+	// asked for from this, and reads it under this name by default
+	// (INTERFACES_FORWARDED_HOST_HEADER in the gateway's config). Renaming it
+	// there without renaming it here fails closed: the gateway falls back to
+	// `Host`, which this proxy has set to the gateway's own name, and refuses.
+	forwardedHostHeader = "X-Forwarded-Host"
+	// Bounds brainbase-mas enforces on a slug: three characters at least, and at
+	// most 63 minus the frame prefix, so both labels fit in a DNS label.
+	minInterfaceSlugLength = 3
+	maxInterfaceSlugLength = 63 - len(frameHostPrefix)
+)
+
+// hostBearingHeaders are cleared from a request before it is forwarded to the
+// gateway. The gateway decides access by host, so a host header a client can set
+// is a privilege escalation and not a cosmetic problem. `X-Forwarded-Host` is
+// then set from a value rebuilt out of the validated label and the configured
+// base domain, so nothing a client sent can survive even in part. The others are
+// names the gateway does not read today and must not start reading from a
+// client: `Forwarded` carries a `host=` parameter, and the other two are what a
+// proxy in front of this one might have been configured to use.
+var hostBearingHeaders = []string{
+	"X-Forwarded-Host",
+	"X-Original-Host",
+	"X-Host",
+	"Forwarded",
+}
 
 // Resolved is the response from mas's POST /internal/preview/resolve.
 type Resolved struct {
@@ -74,7 +136,13 @@ func (e *resolveError) Error() string {
 // contextKey avoids collisions with other packages' context keys.
 type contextKey int
 
-const resolvedContextKey contextKey = iota
+const (
+	resolvedContextKey contextKey = iota
+	// viewerHostContextKey carries the dashboard host a request arrived on from
+	// ServeHTTP, where it was validated, to the gateway director, which is the
+	// only place allowed to put it on the wire.
+	viewerHostContextKey
+)
 
 func validateInputs(previewID string) error {
 	if previewID == "" {
@@ -108,6 +176,19 @@ func NewProxy(config *Config) *Proxy {
 		},
 	}
 
+	p.gateway = &httputil.ReverseProxy{
+		Director: p.gatewayDirector,
+		// No ModifyResponse and no path rewriting: the gateway is a service that
+		// routes on the path itself (`/__bb/...` is reserved on both of an
+		// interface's hosts) and answers every refusal a viewer should see with
+		// its own page. Normalising the path here would move that decision away
+		// from where it is made, and rewriting a response would overwrite it.
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("Interfaces gateway error: host=%s %v", r.Host, err)
+			p.writeInterfaceErrorPage(w, http.StatusBadGateway)
+		},
+	}
+
 	return p
 }
 
@@ -117,10 +198,28 @@ func (p *Proxy) writeErrorPage(w http.ResponseWriter, status int) {
 	w.Write([]byte(errorPageHTML))
 }
 
+// writeInterfaceErrorPage answers on a dashboard host that never reached the
+// gateway. The preview page is not reused because it names a preview, and a
+// person looking at a dashboard address has never heard of one.
+func (p *Proxy) writeInterfaceErrorPage(w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	w.Write([]byte(interfaceErrorPageHTML))
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/health" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+
+	// A dashboard label and a preview id are disjoint by construction - a preview
+	// id has no hyphen and a slug must have one - so this branch cannot take a
+	// host the preview path used to serve. It is first only so that everything
+	// below it is reached on exactly the hosts it was always reached on.
+	if label := leftmostLabel(r.Host, p.config.BaseDomain); isInterfaceLabel(label) {
+		p.serveInterface(w, r, label)
 		return
 	}
 
@@ -179,6 +278,129 @@ func (p *Proxy) director(req *http.Request) {
 	if resolved.Token != "" && resolved.TokenHeader != "" {
 		req.Header.Set(resolved.TokenHeader, resolved.Token) // e.g. x-daytona-preview-token OR e2b-traffic-access-token
 	}
+}
+
+// serveInterface forwards a request on a published dashboard host to the
+// Interfaces gateway.
+//
+// Nothing is resolved here. The gateway already resolves every host it serves
+// through mas's POST /internal/interfaces/resolve-host - that call is how it
+// finds the interface, its live release and the deployment's protection bypass
+// secret - and it refuses a host mas does not answer for. A resolution in this
+// proxy would be a second copy of that decision, a second holder of the internal
+// secret, and a third round trip on a request that already makes two; and it
+// would still not let the gateway skip its own, since a check that assumes an
+// upstream already made it is not a check.
+//
+// So this function's whole job is to hand the request over with the viewer's own
+// host intact, and to refuse when there is nowhere to hand it to.
+func (p *Proxy) serveInterface(w http.ResponseWriter, r *http.Request, label string) {
+	if p.config.InterfacesGatewayURL == nil {
+		// Fail closed, the way an unknown preview id does. A deployment with no
+		// gateway configured serves no dashboards, and the alternative - falling
+		// through to the preview resolve - would ask mas to look up a dashboard
+		// slug as a sandbox id.
+		log.Printf("Interface host refused: host=%s no INTERFACES_GATEWAY_URL configured", r.Host)
+		p.writeInterfaceErrorPage(w, http.StatusNotFound)
+		return
+	}
+
+	// Rebuilt, never copied. The label has already been matched against
+	// interfaceSlugRegex, so it holds nothing but lowercase alphanumerics and
+	// single hyphens, and the base domain is configuration. The value the gateway
+	// reads therefore cannot carry a port, a trailing dot, a comma that would
+	// make it look like a proxy chain, or anything else a client put in the Host
+	// header - not because it was sanitised, but because none of it was used.
+	viewerHost := label + "." + strings.TrimSuffix(strings.ToLower(p.config.BaseDomain), ".")
+	role := "parent"
+	if strings.HasPrefix(label, frameHostPrefix) {
+		role = "frame"
+	}
+	log.Printf("Interface request: host=%s viewerHost=%s role=%s", r.Host, viewerHost, role)
+
+	ctx := context.WithValue(r.Context(), viewerHostContextKey, viewerHost)
+	p.gateway.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// gatewayDirector points a dashboard request at the Interfaces gateway and tells
+// it which host the viewer asked for.
+//
+// Two things have to happen together. req.Host becomes the gateway's own name,
+// because the gateway is reached by name like any other service and a request
+// carrying `ops-console.brainbaselabs.space` as its Host would not route to it.
+// That rewrite is also what makes the forwarded header load-bearing: the
+// gateway's role (parent page or frame), its cookie scope and which interface is
+// being asked for all come from the viewer's host, and after the rewrite the
+// forwarded header is the only place it still exists.
+func (p *Proxy) gatewayDirector(req *http.Request) {
+	viewerHost, ok := req.Context().Value(viewerHostContextKey).(string)
+	if !ok || viewerHost == "" || p.config.InterfacesGatewayURL == nil {
+		// Unreachable through ServeHTTP, which sets both. Fail closed anyway
+		// rather than forward a request with no host for the gateway to read, or
+		// with a client's.
+		log.Printf("gatewayDirector: no viewer host in context")
+		req.URL.Host = "invalid.local"
+		return
+	}
+
+	target := p.config.InterfacesGatewayURL
+	req.URL.Scheme = target.Scheme
+	req.URL.Host = target.Host
+	req.Host = target.Host
+	// Path, RawPath and RawQuery are left exactly as they arrived: the gateway
+	// routes on the path and hands the rest to the dashboard's deployment.
+
+	for _, name := range hostBearingHeaders {
+		req.Header.Del(name)
+	}
+	req.Header.Set(forwardedHostHeader, viewerHost)
+}
+
+// leftmostLabel returns the leftmost DNS label of host, when host sits directly
+// under baseDomain, and "" when it does not. Both routes start here: the preview
+// path reads the label as an opaque sandbox preview id, the Interfaces path reads
+// it as a dashboard slug, optionally behind the frame prefix.
+func leftmostLabel(host, baseDomain string) string {
+	if i := strings.Index(host, ":"); i != -1 {
+		host = host[:i]
+	}
+	// Normalize a single trailing dot (absolute/FQDN form, e.g.
+	// "abc.example.com.") off both host and configured domain, so an absolute
+	// Host header still matches and PREVIEW_BASE_DOMAIN="example.com." doesn't
+	// reject every otherwise-valid preview request.
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	baseDomain = strings.TrimSuffix(strings.ToLower(baseDomain), ".")
+	suffix := "." + baseDomain
+	if !strings.HasSuffix(host, suffix) {
+		return ""
+	}
+	label := strings.TrimSuffix(host, suffix)
+	if label == "" || strings.Contains(label, ".") {
+		return ""
+	}
+	return label
+}
+
+// isInterfaceLabel reports whether a leftmost DNS label addresses a published
+// Interfaces dashboard, in either of its two roles.
+//
+// This is a shape test, not an existence test: whether that dashboard exists,
+// is published and admits this viewer is the gateway's to answer, and it does.
+// What this decides is only which of the two upstreams a host belongs to, and it
+// decides it from the grammar mas can allocate rather than from the presence of a
+// hyphen, so a future hyphenated name under this domain is a name this proxy has
+// to be taught rather than one it silently captures.
+func isInterfaceLabel(label string) bool {
+	slug := strings.TrimPrefix(label, frameHostPrefix)
+	if len(slug) < minInterfaceSlugLength || len(slug) > maxInterfaceSlugLength {
+		return false
+	}
+	if strings.HasPrefix(slug, frameHostPrefix) {
+		// `app--app--x-y`: the frame prefix is reserved, and a name that doubles
+		// it is not a host either role can own. mas refuses to allocate it.
+		return false
+	}
+	return interfaceSlugRegex.MatchString(slug)
 }
 
 // resolve calls mas's POST /internal/preview/resolve to turn an opaque
@@ -259,7 +481,47 @@ func loadConfig() *Config {
 		log.Fatal("MAS_BASE_URL and PREVIEW_RESOLVE_SECRET must be set")
 	}
 
+	config.InterfacesGatewayURL = interfacesGatewayURL(os.Getenv("INTERFACES_GATEWAY_URL"))
+
 	return config
+}
+
+// interfacesGatewayURL parses INTERFACES_GATEWAY_URL, which is optional: unset
+// means this deployment serves no dashboards and refuses their hosts.
+//
+// Set but unusable is fatal rather than treated as unset. A typo would otherwise
+// take every dashboard offline quietly while the proxy reported healthy, and the
+// loud version is contained: Render only cuts traffic over to a deployment that
+// booted, so a bad value fails the deploy and leaves the running one, and with it
+// the preview path, alone.
+func interfacesGatewayURL(raw string) *url.URL {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		log.Fatalf("INTERFACES_GATEWAY_URL is not a URL: %v", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		log.Fatalf("INTERFACES_GATEWAY_URL must be http or https, got %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		log.Fatal("INTERFACES_GATEWAY_URL must name a host")
+	}
+	// An origin and nothing else. The path arrives from the viewer and is
+	// forwarded untouched, so a base path here would be silently dropped, and a
+	// query or a userinfo section would be a credential or a parameter this proxy
+	// has no business adding to somebody's request.
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" ||
+		parsed.Fragment != "" || parsed.User != nil {
+		log.Fatalf(
+			"INTERFACES_GATEWAY_URL must be a bare origin (scheme://host[:port]), got %q",
+			raw,
+		)
+	}
+	parsed.Path = ""
+	return parsed
 }
 
 func main() {
@@ -290,6 +552,11 @@ func main() {
 		log.Printf("Starting proxy server on port %s", config.Port)
 		log.Printf("mas base URL: %s", config.MasBaseURL)
 		log.Printf("Preview base domain: %s", config.BaseDomain)
+		if config.InterfacesGatewayURL != nil {
+			log.Printf("Interfaces gateway: %s", config.InterfacesGatewayURL)
+		} else {
+			log.Printf("Interfaces gateway: not configured (dashboard hosts are refused)")
+		}
 		log.Printf("Server ready to accept connections")
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -312,24 +579,7 @@ func main() {
 // previewIdFromHost returns the leftmost DNS label as the opaque preview id.
 // Host form: {previewId}.<baseDomain>. Empty string if it doesn't match.
 func previewIdFromHost(host, baseDomain string) string {
-	if i := strings.Index(host, ":"); i != -1 {
-		host = host[:i]
-	}
-	// Normalize a single trailing dot (absolute/FQDN form, e.g.
-	// "abc.example.com.") off both host and configured domain, so an absolute
-	// Host header still matches and PREVIEW_BASE_DOMAIN="example.com." doesn't
-	// reject every otherwise-valid preview request.
-	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	baseDomain = strings.TrimSuffix(strings.ToLower(baseDomain), ".")
-	suffix := "." + baseDomain
-	if !strings.HasSuffix(host, suffix) {
-		return ""
-	}
-	label := strings.TrimSuffix(host, suffix)
-	if label == "" || strings.Contains(label, ".") {
-		return ""
-	}
-	return label
+	return leftmostLabel(host, baseDomain)
 }
 
 // cleanRequestPath resolves "." and ".." within a client-supplied path so it

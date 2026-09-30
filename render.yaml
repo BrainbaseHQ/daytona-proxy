@@ -16,3 +16,8 @@ services:
         sync: false
       - key: PREVIEW_BASE_DOMAIN
         value: brainbaselabs.space
+      # Where hyphenated hosts - published Interfaces dashboards - are
+      # forwarded. Set in the dashboard, not here: it is an internal address.
+      # Left unset, dashboard hosts are refused and previews are unaffected.
+      - key: INTERFACES_GATEWAY_URL
+        sync: false
