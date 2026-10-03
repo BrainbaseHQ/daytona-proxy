@@ -905,3 +905,90 @@ func TestAnEventStreamIsNotBufferedOnTheWayToTheViewer(t *testing.T) {
 	}
 	close(released)
 }
+
+// TestAConnectionHeaderCannotStripTheViewersHost: ReverseProxy deletes every
+// header a client names in `Connection` after the director has run, so a client
+// naming X-Forwarded-Host there would remove the value the director set and the
+// gateway would see no viewer host at all.
+func TestAConnectionHeaderCannotStripTheViewersHost(t *testing.T) {
+	const host = "ops-console.brainbaselabs.space"
+	for _, connection := range []string{
+		"X-Forwarded-Host",
+		"keep-alive, x-forwarded-host",
+		"Forwarded, X-Host, X-Original-Host, X-Forwarded-Host",
+	} {
+		t.Run(connection, func(t *testing.T) {
+			var seen http.Header
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen = r.Header.Clone()
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer gateway.Close()
+
+			proxy := NewProxy(&Config{
+				MasBaseURL:           "http://mas.invalid",
+				PreviewResolveSecret: "test-secret",
+				BaseDomain:           "brainbaselabs.space",
+				InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+			})
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Host = host
+			req.Header.Set("Connection", connection)
+			rec := httptest.NewRecorder()
+			proxy.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if got := seen.Get("X-Forwarded-Host"); got != host {
+				t.Errorf("gateway saw X-Forwarded-Host = %q, want %q", got, host)
+			}
+		})
+	}
+}
+
+func TestDropConnectionTokensKeepsEverythingItWasNotAskedToDrop(t *testing.T) {
+	h := http.Header{}
+	h.Add("Connection", "Upgrade, X-Forwarded-Host")
+	h.Add("Connection", "keep-alive,x-host")
+	dropConnectionTokens(h, hostBearingHeaders)
+	if got := h.Values("Connection"); len(got) != 1 || got[0] != "Upgrade, keep-alive" {
+		t.Errorf("Connection = %q, want [\"Upgrade, keep-alive\"]", got)
+	}
+
+	only := http.Header{"Connection": {"X-Forwarded-Host"}}
+	dropConnectionTokens(only, hostBearingHeaders)
+	if _, ok := only["Connection"]; ok {
+		t.Errorf("an emptied Connection header was kept: %q", only.Values("Connection"))
+	}
+}
+
+func TestParseInterfacesGatewayURLRefusesWhatCannotBeDialled(t *testing.T) {
+	for _, raw := range []string{
+		"https://gw.internal:99999",
+		"https://gw.internal:0",
+		"https://gw.internal:",
+		"http://:8080",
+		"ftp://gw.internal",
+		"https://gw.internal/base",
+		"https://gw.internal?x=1",
+		"https://user:pass@gw.internal",
+	} {
+		if got, err := parseInterfacesGatewayURL(raw); err == nil {
+			t.Errorf("%q was accepted as %v, want an error", raw, got)
+		}
+	}
+	for raw, wantHost := range map[string]string{
+		"http://brainbase-interfaces-gateway:8080": "brainbase-interfaces-gateway:8080",
+		"https://gw.internal:65535":                "gw.internal:65535",
+		"https://gw.internal":                      "gw.internal",
+	} {
+		got, err := parseInterfacesGatewayURL(raw)
+		if err != nil || got == nil || got.Host != wantHost {
+			t.Errorf("%q = %v, %v; want host %q", raw, got, err, wantHost)
+		}
+	}
+	if got, err := parseInterfacesGatewayURL("   "); got != nil || err != nil {
+		t.Errorf("blank = %v, %v; want unset", got, err)
+	}
+}

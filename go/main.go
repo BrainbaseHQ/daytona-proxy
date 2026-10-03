@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	stdpath "path"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -353,7 +354,46 @@ func (p *Proxy) gatewayDirector(req *http.Request) {
 	for _, name := range hostBearingHeaders {
 		req.Header.Del(name)
 	}
+	// ReverseProxy deletes every header the client names in `Connection` after
+	// this director returns, so `Connection: X-Forwarded-Host` would strip the
+	// value set below and leave the gateway with no viewer host at all. Those
+	// names are taken out of the list first; every other token, `Upgrade`
+	// included, is kept.
+	dropConnectionTokens(req.Header, hostBearingHeaders)
 	req.Header.Set(forwardedHostHeader, viewerHost)
+}
+
+// dropConnectionTokens removes the given header names from the `Connection`
+// header's token list, compared case-insensitively, and removes `Connection`
+// itself when nothing is left in it.
+func dropConnectionTokens(h http.Header, names []string) {
+	values := h.Values("Connection")
+	if len(values) == 0 {
+		return
+	}
+	var kept []string
+	for _, value := range values {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+			named := false
+			for _, name := range names {
+				if strings.EqualFold(token, name) {
+					named = true
+					break
+				}
+			}
+			if !named {
+				kept = append(kept, token)
+			}
+		}
+	}
+	h.Del("Connection")
+	if len(kept) > 0 {
+		h.Set("Connection", strings.Join(kept, ", "))
+	}
 }
 
 // leftmostLabel returns the leftmost DNS label of host, when host sits directly
@@ -495,19 +535,39 @@ func loadConfig() *Config {
 // booted, so a bad value fails the deploy and leaves the running one, and with it
 // the preview path, alone.
 func interfacesGatewayURL(raw string) *url.URL {
+	parsed, err := parseInterfacesGatewayURL(raw)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return parsed
+}
+
+// parseInterfacesGatewayURL is interfacesGatewayURL's decision, returned rather
+// than fatal so every refusal can be tested. Nil and no error means unset.
+func parseInterfacesGatewayURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil
+		return nil, nil
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		log.Fatalf("INTERFACES_GATEWAY_URL is not a URL: %v", err)
+		return nil, fmt.Errorf("INTERFACES_GATEWAY_URL is not a URL: %v", err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		log.Fatalf("INTERFACES_GATEWAY_URL must be http or https, got %q", parsed.Scheme)
+		return nil, fmt.Errorf("INTERFACES_GATEWAY_URL must be http or https, got %q", parsed.Scheme)
 	}
-	if parsed.Host == "" {
-		log.Fatal("INTERFACES_GATEWAY_URL must name a host")
+	if parsed.Hostname() == "" {
+		return nil, fmt.Errorf("INTERFACES_GATEWAY_URL must name a host, got %q", raw)
+	}
+	// url.Parse checks that a port is digits and nothing more, so `:99999` and
+	// `:0` parse, boot healthy, and fail every dashboard request at dial time.
+	// A trailing colon with no port is refused for the same reason.
+	if port := parsed.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("INTERFACES_GATEWAY_URL has an invalid port %q", port)
+		}
+	} else if strings.HasSuffix(parsed.Host, ":") {
+		return nil, fmt.Errorf("INTERFACES_GATEWAY_URL has an empty port, got %q", raw)
 	}
 	// An origin and nothing else. The path arrives from the viewer and is
 	// forwarded untouched, so a base path here would be silently dropped, and a
@@ -515,13 +575,13 @@ func interfacesGatewayURL(raw string) *url.URL {
 	// has no business adding to somebody's request.
 	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" ||
 		parsed.Fragment != "" || parsed.User != nil {
-		log.Fatalf(
+		return nil, fmt.Errorf(
 			"INTERFACES_GATEWAY_URL must be a bare origin (scheme://host[:port]), got %q",
 			raw,
 		)
 	}
 	parsed.Path = ""
-	return parsed
+	return parsed, nil
 }
 
 func main() {
