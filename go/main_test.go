@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -418,5 +419,576 @@ func TestDirectorCannotEscapeUpstreamBasePath(t *testing.T) {
 				t.Fatalf("serialized path %q escaped the upstream base or kept a traversal", escaped)
 			}
 		})
+	}
+}
+
+// --- Interfaces dashboard hosts -------------------------------------------
+//
+// A dashboard is reachable only if a hyphenated host is recognised, forwarded to
+// the gateway, and arrives there still carrying the host the viewer asked for.
+// The first of those is a pure function and is tested as one; the other two are
+// only meaningful against a real HTTP server, so every test below that claims
+// something about the wire stands up an httptest server and reads what it
+// received.
+
+func TestIsInterfaceLabel(t *testing.T) {
+	tests := []struct {
+		name  string
+		label string
+		want  bool
+	}{
+		{name: "a generated slug", label: "uhbn9-egrjs", want: true},
+		{name: "its frame sibling", label: "app--uhbn9-egrjs", want: true},
+		{name: "a readable slug", label: "ops-console", want: true},
+		{name: "three hyphen groups", label: "a-b-c", want: true},
+		{name: "the shortest legal slug", label: "a-b", want: true},
+		{name: "a slug that merely starts with app", label: "app-console", want: true},
+
+		// Everything the preview path owns, and must keep owning.
+		{name: "a preview id", label: "abc", want: false},
+		{name: "a long preview id", label: "b7f3a9c1d2e4", want: false},
+		{name: "no label at all", label: "", want: false},
+
+		// Hyphenated names that are not dashboards.
+		{name: "punycode", label: "xn--80ak6aa92e", want: false},
+		{name: "an underscore service record", label: "_acme-challenge", want: false},
+		{name: "a doubled hyphen", label: "ops--console", want: false},
+		{name: "a leading hyphen", label: "-ops-console", want: false},
+		{name: "a trailing hyphen", label: "ops-console-", want: false},
+		{name: "uppercase, which a DNS label is not", label: "Ops-Console", want: false},
+
+		// The reserved frame prefix, in the shapes mas refuses to allocate.
+		{name: "the frame prefix alone", label: "app--", want: false},
+		{name: "the frame prefix doubled", label: "app--app--ops-console", want: false},
+
+		// Length, which is what makes both labels fit one DNS label each.
+		{name: "one character short", label: "ab", want: false},
+		{name: "the longest slug that fits app-- too", label: "a-" + strings.Repeat("b", 56), want: true},
+		{name: "one character too long", label: "a-" + strings.Repeat("b", 57), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isInterfaceLabel(tt.label); got != tt.want {
+				t.Errorf("isInterfaceLabel(%q) = %v, want %v", tt.label, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestInterfaceLabelsAndPreviewIdsAreDisjoint is the claim the routing order
+// rests on. Asserted over the whole alphabet a DNS label may contain rather than
+// over a handful of examples, because "these two predicates cannot both be true"
+// is not a property a list of names can establish.
+func TestInterfaceLabelsAndPreviewIdsAreDisjoint(t *testing.T) {
+	const alphabet = "ab9-_"
+	var label []byte
+	var walk func(depth int)
+	checked := 0
+	walk = func(depth int) {
+		if depth == 0 {
+			candidate := string(label)
+			checked++
+			if isInterfaceLabel(candidate) && previewIDRegex.MatchString(candidate) {
+				t.Fatalf("label %q is claimed by both routes", candidate)
+			}
+			return
+		}
+		for i := 0; i < len(alphabet); i++ {
+			label = append(label, alphabet[i])
+			walk(depth - 1)
+			label = label[:len(label)-1]
+		}
+	}
+	for length := 1; length <= 6; length++ {
+		walk(length)
+	}
+	if checked < 15000 {
+		t.Fatalf("only %d candidates checked; the walk is not covering what it claims", checked)
+	}
+}
+
+// newInterfaceProxy stands up a stub gateway that records the request it was
+// given, plus a mas stub that fails the test if it is ever called: resolving a
+// dashboard host is the gateway's job, and a proxy-side resolve would show up
+// here as a call.
+func newInterfaceProxy(t *testing.T, handler http.HandlerFunc) *Proxy {
+	t.Helper()
+
+	gateway := httptest.NewServer(handler)
+	t.Cleanup(gateway.Close)
+
+	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("mas was called for a dashboard host: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(mas.Close)
+
+	return NewProxy(&Config{
+		MasBaseURL:           mas.URL,
+		PreviewResolveSecret: "test-secret",
+		BaseDomain:           "brainbaselabs.space",
+		InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+	})
+}
+
+func TestDashboardHostReachesTheGatewayCarryingTheViewersHost(t *testing.T) {
+	for _, host := range []string{
+		"uhbn9-egrjs.brainbaselabs.space",
+		"app--uhbn9-egrjs.brainbaselabs.space",
+	} {
+		t.Run(host, func(t *testing.T) {
+			var seen http.Header
+			var seenHost, seenTarget string
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen = r.Header.Clone()
+				seenHost = r.Host
+				seenTarget = r.URL.RequestURI()
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("<title>Dashboard</title>"))
+			}))
+			defer gateway.Close()
+
+			proxy := NewProxy(&Config{
+				MasBaseURL:           "http://mas.invalid",
+				PreviewResolveSecret: "test-secret",
+				BaseDomain:           "brainbaselabs.space",
+				InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/dash?tab=1", nil)
+			req.Host = host
+			rec := httptest.NewRecorder()
+			proxy.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+			}
+			if got := seen.Get("X-Forwarded-Host"); got != host {
+				t.Errorf("gateway saw X-Forwarded-Host = %q, want %q", got, host)
+			}
+			// The Host the gateway is reached by is its own, or it would not
+			// route; the viewer's host survives only in the forwarded header.
+			if want := interfacesGatewayURL(gateway.URL).Host; seenHost != want {
+				t.Errorf("gateway saw Host = %q, want %q", seenHost, want)
+			}
+			if seenTarget != "/dash?tab=1" {
+				t.Errorf("gateway saw target = %q, want %q", seenTarget, "/dash?tab=1")
+			}
+		})
+	}
+}
+
+// TestAClientCannotChooseWhichDashboardItIsTreatedAs is the test this branch
+// exists to survive. The gateway decides which interface is being asked for, and
+// whether this viewer may see it, from the forwarded host; a client that could
+// set that header would be choosing which dashboard its own session is checked
+// against.
+func TestAClientCannotChooseWhichDashboardItIsTreatedAs(t *testing.T) {
+	spoofs := []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{name: "the header itself", header: "X-Forwarded-Host", value: "payroll-hq.brainbaselabs.space"},
+		{name: "lowercased", header: "x-forwarded-host", value: "payroll-hq.brainbaselabs.space"},
+		{name: "as a proxy chain", header: "X-Forwarded-Host", value: "payroll-hq.brainbaselabs.space, ops-console.brainbaselabs.space"},
+		{name: "with a comma appended", header: "X-Forwarded-Host", value: "ops-console.brainbaselabs.space, payroll-hq.brainbaselabs.space"},
+		{name: "the RFC 7239 header", header: "Forwarded", value: "host=payroll-hq.brainbaselabs.space"},
+		{name: "an aliased header", header: "X-Original-Host", value: "payroll-hq.brainbaselabs.space"},
+		{name: "another aliased header", header: "X-Host", value: "payroll-hq.brainbaselabs.space"},
+	}
+
+	for _, spoof := range spoofs {
+		t.Run(spoof.name, func(t *testing.T) {
+			var seen http.Header
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen = r.Header.Clone()
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer gateway.Close()
+
+			proxy := NewProxy(&Config{
+				MasBaseURL:           "http://mas.invalid",
+				PreviewResolveSecret: "test-secret",
+				BaseDomain:           "brainbaselabs.space",
+				InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Host = "ops-console.brainbaselabs.space"
+			req.Header.Set(spoof.header, spoof.value)
+			rec := httptest.NewRecorder()
+			proxy.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if got := seen.Get("X-Forwarded-Host"); got != "ops-console.brainbaselabs.space" {
+				t.Errorf("gateway saw X-Forwarded-Host = %q, want the host the request arrived on", got)
+			}
+			for _, name := range hostBearingHeaders {
+				if name == "X-Forwarded-Host" {
+					continue
+				}
+				if got := seen.Get(name); got != "" {
+					t.Errorf("gateway saw %s = %q, want it stripped", name, got)
+				}
+			}
+		})
+	}
+}
+
+// TestAPortOrTrailingDotDoesNotReachTheGateway guards the rebuild rather than a
+// sanitise: the forwarded host is assembled from the matched label and the
+// configured base domain, so nothing the client wrote can arrive even in part.
+func TestAPortOrTrailingDotDoesNotReachTheGateway(t *testing.T) {
+	for _, host := range []string{
+		"ops-console.brainbaselabs.space:443",
+		"ops-console.brainbaselabs.space.",
+		"OPS-CONSOLE.brainbaselabs.space",
+		"ops-console.brainbaselabs.space.:8080",
+	} {
+		t.Run(host, func(t *testing.T) {
+			var seen string
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen = r.Header.Get("X-Forwarded-Host")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer gateway.Close()
+
+			proxy := NewProxy(&Config{
+				MasBaseURL:           "http://mas.invalid",
+				PreviewResolveSecret: "test-secret",
+				BaseDomain:           "brainbaselabs.space",
+				InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Host = host
+			rec := httptest.NewRecorder()
+			proxy.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if seen != "ops-console.brainbaselabs.space" {
+				t.Errorf("gateway saw X-Forwarded-Host = %q, want the canonical host", seen)
+			}
+		})
+	}
+}
+
+// TestTheProxyDoesNotResolveADashboardHost is the "who resolves it" decision,
+// asserted rather than described. The mas stub fails the test if it is called at
+// all, so a proxy-side resolution cannot be added without this going red.
+func TestTheProxyDoesNotResolveADashboardHost(t *testing.T) {
+	proxy := newInterfaceProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "ops-console.brainbaselabs.space"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if _, found := proxy.cache.Get("ops-console"); found {
+		t.Error("a dashboard host was cached as a preview resolution")
+	}
+}
+
+// TestTheGatewaysOwnRefusalReachesTheViewer: an unknown dashboard host fails
+// closed, and it is the gateway's 404 that is served, not this proxy's page.
+// Both halves matter - a proxy that replaced the gateway's answer would show a
+// person a page about previews.
+func TestTheGatewaysOwnRefusalReachesTheViewer(t *testing.T) {
+	const gatewayRefusal = "This dashboard is not available"
+	proxy := newInterfaceProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(gatewayRefusal))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "no-such-dashboard.brainbaselabs.space"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+	if got := rec.Body.String(); got != gatewayRefusal {
+		t.Errorf("body = %q, want the gateway's own refusal", got)
+	}
+}
+
+func TestADashboardHostIsRefusedWhenNoGatewayIsConfigured(t *testing.T) {
+	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("mas was called with no gateway configured: %s", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer mas.Close()
+
+	proxy := NewProxy(&Config{
+		MasBaseURL:           mas.URL,
+		PreviewResolveSecret: "test-secret",
+		BaseDomain:           "brainbaselabs.space",
+		// InterfacesGatewayURL deliberately nil.
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "ops-console.brainbaselabs.space"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (fail closed)", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "Preview Unavailable") {
+		t.Error("a dashboard host was refused with the sandbox-preview error page")
+	}
+}
+
+func TestAnUnreachableGatewayIs502AndNotThePreviewPage(t *testing.T) {
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := gateway.URL
+	gateway.Close() // nothing is listening there now
+
+	proxy := NewProxy(&Config{
+		MasBaseURL:           "http://mas.invalid",
+		PreviewResolveSecret: "test-secret",
+		BaseDomain:           "brainbaselabs.space",
+		InterfacesGatewayURL: interfacesGatewayURL(url),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "ops-console.brainbaselabs.space"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "Preview Unavailable") {
+		t.Error("a dashboard host got the sandbox-preview error page")
+	}
+}
+
+// TestTheBodyAndMethodSurviveTheHop: the dashboard's data path is POST
+// /__bb/api/{action} with a JSON body, so a hop that dropped either would leave
+// a dashboard that loads and does nothing.
+func TestTheBodyAndMethodSurviveTheHop(t *testing.T) {
+	var seenMethod, seenPath string
+	var seenBody []byte
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod, seenPath = r.Method, r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer gateway.Close()
+
+	proxy := NewProxy(&Config{
+		MasBaseURL:           "http://mas.invalid",
+		PreviewResolveSecret: "test-secret",
+		BaseDomain:           "brainbaselabs.space",
+		InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/__bb/api/messages.send",
+		strings.NewReader(`{"thread_id":"thr_1"}`))
+	req.Host = "app--ops-console.brainbaselabs.space"
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if seenMethod != http.MethodPost || seenPath != "/__bb/api/messages.send" {
+		t.Errorf("gateway saw %s %s, want POST /__bb/api/messages.send", seenMethod, seenPath)
+	}
+	if string(seenBody) != `{"thread_id":"thr_1"}` {
+		t.Errorf("gateway saw body %q, want the JSON that was sent", seenBody)
+	}
+}
+
+func TestInterfacesGatewayURLRefusesAnythingButABareOrigin(t *testing.T) {
+	if got := interfacesGatewayURL(""); got != nil {
+		t.Errorf("empty INTERFACES_GATEWAY_URL = %v, want nil", got)
+	}
+	if got := interfacesGatewayURL("  https://gw.internal:8443  "); got == nil || got.Host != "gw.internal:8443" {
+		t.Errorf("a padded origin did not parse: %v", got)
+	}
+	// A trailing slash is the one path that is really no path.
+	if got := interfacesGatewayURL("https://gw.internal/"); got == nil || got.Path != "" {
+		t.Errorf("a trailing slash was not normalised away: %v", got)
+	}
+}
+
+// TestAnEventStreamIsNotBufferedOnTheWayToTheViewer: the dashboard's Activity
+// panel is one long-lived `GET /__bb/api/events.subscribe`, so a hop that
+// buffered it would leave a panel that shows everything at once when the stream
+// finally closes, and nothing before then. Run over a real listener and a real
+// client rather than a recorder, because a recorder cannot tell a flush from a
+// buffer.
+func TestAnEventStreamIsNotBufferedOnTheWayToTheViewer(t *testing.T) {
+	released := make(chan struct{})
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("event: first\ndata: 1\n\n"))
+		w.(http.Flusher).Flush()
+		// The second event is written only once the client has been seen to
+		// receive the first, so a pass cannot come from lucky timing.
+		<-released
+		_, _ = w.Write([]byte("event: second\ndata: 2\n\n"))
+		w.(http.Flusher).Flush()
+	}))
+	defer gateway.Close()
+
+	front := httptest.NewServer(NewProxy(&Config{
+		MasBaseURL:           "http://mas.invalid",
+		PreviewResolveSecret: "test-secret",
+		BaseDomain:           "brainbaselabs.space",
+		InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+	}))
+	defer front.Close()
+
+	req, err := http.NewRequest(http.MethodGet, front.URL+"/__bb/api/events.subscribe", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "app--ops-console.brainbaselabs.space"
+	// A deadline on the whole exchange, so a hop that buffers fails here in
+	// seconds instead of hanging until the package timeout and looking like a
+	// broken test rather than a broken proxy.
+	client := front.Client()
+	client.Timeout = 4 * time.Second
+	resp, err := client.Do(req)
+	if err != nil {
+		close(released)
+		t.Fatalf("stream request never returned headers, which is what buffering looks like: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+
+	buf := make([]byte, 64)
+	type read struct {
+		n   int
+		err error
+	}
+	got := make(chan read, 1)
+	go func() {
+		n, err := resp.Body.Read(buf)
+		got <- read{n, err}
+	}()
+
+	select {
+	case r := <-got:
+		if r.err != nil {
+			t.Fatalf("first read: %v", r.err)
+		}
+		if want := "event: first"; !strings.Contains(string(buf[:r.n]), want) {
+			t.Errorf("first chunk = %q, want it to contain %q", buf[:r.n], want)
+		}
+	case <-time.After(3 * time.Second):
+		close(released)
+		t.Fatal("the first event never arrived: the stream is being buffered")
+	}
+	close(released)
+}
+
+// TestAConnectionHeaderCannotStripTheViewersHost: ReverseProxy deletes every
+// header a client names in `Connection` after the director has run, so a client
+// naming X-Forwarded-Host there would remove the value the director set and the
+// gateway would see no viewer host at all.
+func TestAConnectionHeaderCannotStripTheViewersHost(t *testing.T) {
+	const host = "ops-console.brainbaselabs.space"
+	for _, connection := range []string{
+		"X-Forwarded-Host",
+		"keep-alive, x-forwarded-host",
+		"Forwarded, X-Host, X-Original-Host, X-Forwarded-Host",
+	} {
+		t.Run(connection, func(t *testing.T) {
+			var seen http.Header
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen = r.Header.Clone()
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer gateway.Close()
+
+			proxy := NewProxy(&Config{
+				MasBaseURL:           "http://mas.invalid",
+				PreviewResolveSecret: "test-secret",
+				BaseDomain:           "brainbaselabs.space",
+				InterfacesGatewayURL: interfacesGatewayURL(gateway.URL),
+			})
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Host = host
+			req.Header.Set("Connection", connection)
+			rec := httptest.NewRecorder()
+			proxy.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if got := seen.Get("X-Forwarded-Host"); got != host {
+				t.Errorf("gateway saw X-Forwarded-Host = %q, want %q", got, host)
+			}
+		})
+	}
+}
+
+func TestDropConnectionTokensKeepsEverythingItWasNotAskedToDrop(t *testing.T) {
+	h := http.Header{}
+	h.Add("Connection", "Upgrade, X-Forwarded-Host")
+	h.Add("Connection", "keep-alive,x-host")
+	dropConnectionTokens(h, hostBearingHeaders)
+	if got := h.Values("Connection"); len(got) != 1 || got[0] != "Upgrade, keep-alive" {
+		t.Errorf("Connection = %q, want [\"Upgrade, keep-alive\"]", got)
+	}
+
+	only := http.Header{"Connection": {"X-Forwarded-Host"}}
+	dropConnectionTokens(only, hostBearingHeaders)
+	if _, ok := only["Connection"]; ok {
+		t.Errorf("an emptied Connection header was kept: %q", only.Values("Connection"))
+	}
+}
+
+func TestParseInterfacesGatewayURLRefusesWhatCannotBeDialled(t *testing.T) {
+	for _, raw := range []string{
+		"https://gw.internal:99999",
+		"https://gw.internal:0",
+		"https://gw.internal:",
+		"http://:8080",
+		"ftp://gw.internal",
+		"https://gw.internal/base",
+		"https://gw.internal?x=1",
+		"https://user:pass@gw.internal",
+	} {
+		if got, err := parseInterfacesGatewayURL(raw); err == nil {
+			t.Errorf("%q was accepted as %v, want an error", raw, got)
+		}
+	}
+	for raw, wantHost := range map[string]string{
+		"http://brainbase-interfaces-gateway:8080": "brainbase-interfaces-gateway:8080",
+		"https://gw.internal:65535":                "gw.internal:65535",
+		"https://gw.internal":                      "gw.internal",
+	} {
+		got, err := parseInterfacesGatewayURL(raw)
+		if err != nil || got == nil || got.Host != wantHost {
+			t.Errorf("%q = %v, %v; want host %q", raw, got, err, wantHost)
+		}
+	}
+	if got, err := parseInterfacesGatewayURL("   "); got != nil || err != nil {
+		t.Errorf("blank = %v, %v; want unset", got, err)
 	}
 }

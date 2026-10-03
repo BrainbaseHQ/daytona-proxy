@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dashboard unavailable</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          sans-serif;
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f6f7f9;
+        color: #1c1e21;
+      }
+      main {
+        max-width: 28rem;
+        padding: 2rem;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0 0 0.75rem;
+      }
+      p {
+        margin: 0;
+        line-height: 1.6;
+        color: #55595f;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      Shown only when the request never reached the Interfaces gateway: the
+      gateway is unconfigured here, or it could not be dialled. Every refusal the
+      gateway itself can make - wrong address, archived, no access - is the
+      gateway's own page, and the wording matches it so the two do not read as
+      different products. The sandbox-preview error page is not reused because it
+      names a preview, which a dashboard is not.
+    -->
+    <main>
+      <h1>This dashboard is not available</h1>
+      <p>
+        The address may be wrong, or the dashboard may not be reachable right
+        now. Ask whoever shared it with you.
+      </p>
+    </main>
+  </body>
+</html>
