@@ -444,6 +444,12 @@ func TestIsInterfaceLabel(t *testing.T) {
 		{name: "the shortest legal slug", label: "a-b", want: true},
 		{name: "a slug that merely starts with app", label: "app-console", want: true},
 
+		// An interface's preview address, `<slug>-preview`, is served by the same
+		// gateway. mas refuses a slug that ends in -preview, and caps slugs at 50
+		// so the preview label stays within the 58 characters this proxy accepts.
+		{name: "a preview host", label: "uhbn9-egrjs-preview", want: true},
+		{name: "the longest slug's preview host", label: "a-" + strings.Repeat("b", 48) + "-preview", want: true},
+
 		// Everything the preview path owns, and must keep owning.
 		{name: "a preview id", label: "abc", want: false},
 		{name: "a long preview id", label: "b7f3a9c1d2e4", want: false},
