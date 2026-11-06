@@ -21,7 +21,7 @@ import (
 )
 
 // resilienceEnabled reads PROXY_RESILIENCE. A raw value may be passed for
-// tests; when empty the process environment decides.
+// tests; when no argument is passed, the process environment decides.
 func resilienceEnabled(raw ...string) bool {
 	value := ""
 	if len(raw) > 0 {
