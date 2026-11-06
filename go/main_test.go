@@ -3,10 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -996,5 +1003,758 @@ func TestParseInterfacesGatewayURLRefusesWhatCannotBeDialled(t *testing.T) {
 	}
 	if got, err := parseInterfacesGatewayURL("   "); got != nil || err != nil {
 		t.Errorf("blank = %v, %v; want unset", got, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ENG-1504 U24 steps 7-8 (PROXY_RESILIENCE). Every test states the switch it
+// runs under; the default everywhere else in this file is unset = off, so the
+// pre-existing tests keep pinning today's behaviour.
+// ---------------------------------------------------------------------------
+
+// setResilience pins PROXY_RESILIENCE for one test via the environment, the
+// way NewProxy reads it in production.
+func setResilience(t *testing.T, on bool) {
+	t.Helper()
+	if on {
+		t.Setenv("PROXY_RESILIENCE", "1")
+	} else {
+		t.Setenv("PROXY_RESILIENCE", "")
+	}
+}
+
+// newScriptedProxy builds a Proxy via NewProxy (real reverse proxies, real
+// transport) against a counting local mas stub whose responses `handler`
+// scripts. The mas stub asserts the resolve request shape on every POST.
+func newScriptedProxy(t *testing.T, on bool, handler http.HandlerFunc) (*Proxy, *int32) {
+	t.Helper()
+	setResilience(t, on)
+	var posts int32
+	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/preview/resolve" {
+			t.Errorf("unexpected mas path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Internal-Secret"); got != "test-secret" {
+			t.Errorf("X-Internal-Secret = %q, want %q", got, "test-secret")
+		}
+		atomic.AddInt32(&posts, 1)
+		handler(w, r)
+	}))
+	t.Cleanup(mas.Close)
+	p := NewProxy(&Config{
+		MasBaseURL:           mas.URL,
+		PreviewResolveSecret: "test-secret",
+		BaseDomain:           "preview.test",
+	})
+	return p, &posts
+}
+
+// newUpstream stands up a real local app for the proxy to forward to.
+func newUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "upstream ok")
+	}))
+	t.Cleanup(upstream.Close)
+	return upstream
+}
+
+// deadMasURL returns a URL whose server has already been closed, so dialing
+// it is a connection refused - mas down at the wire level.
+func deadMasURL(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	server.Close()
+	return server.URL
+}
+
+// newDeadMasProxy is newScriptedProxy with mas unreachable. POSTs cannot be
+// counted against a closed port; the counter returned counts dials observed
+// by an instrumented transport is not needed - connection refused is the
+// scripted failure itself.
+func newDeadMasProxy(t *testing.T, on bool) *Proxy {
+	t.Helper()
+	setResilience(t, on)
+	p := NewProxy(&Config{
+		MasBaseURL:           deadMasURL(t),
+		PreviewResolveSecret: "test-secret",
+		BaseDomain:           "preview.test",
+	})
+	return p
+}
+
+func previewTestRequest(previewID string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = previewID + ".preview.test"
+	return req
+}
+
+func servePreview(p *Proxy, previewID string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, previewTestRequest(previewID))
+	return rec
+}
+
+// TestResolveRetries502ThenSucceeds is the U24 step 7 scenario: a local mas
+// stub returns 502 once (deploy blip), then 200; with PROXY_RESILIENCE on the
+// retry rides it out and the preview request reaches the real upstream.
+func TestResolveRetries502ThenSucceeds(t *testing.T) {
+	setResilience(t, true)
+	upstream := newUpstream(t)
+
+	resolvedBody := func() []byte {
+		b, _ := json.Marshal(Resolved{UpstreamURL: upstream.URL})
+		return b
+	}
+
+	served := make(chan struct{}, 1)
+	var masPosts int32
+	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&masPosts, 1) == 1 {
+			// first POST: 502 in the fixture's error shape
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprint(w, `{"error":{"code":"api_error","message":"upstream provider unavailable","status":502}}`)
+			served <- struct{}{}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(resolvedBody())
+	})
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "upstream ok" {
+		t.Errorf("body = %q, want the upstream's", got)
+	}
+	if n := atomic.LoadInt32(posts); n != 2 {
+		t.Errorf("mas saw %d POSTs, want 2 (one 502, one 200)", n)
+	}
+	if got := rec.Header().Get("Stale"); got != "" {
+		t.Errorf("Stale header = %q on a fresh resolution, want unset", got)
+	}
+}
+
+// TestResolveDoesNotRetryWhenOff pins today's behaviour with the switch off:
+// one 502 from mas becomes the branded 502 page after exactly one POST, and
+// no Stale header is ever set.
+func TestResolveDoesNotRetryWhenOff(t *testing.T) {
+	p, posts := newScriptedProxy(t, false, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"detail":"deploy blip"}`)
+	})
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if got := rec.Body.String(); got != errorPageHTML {
+		t.Errorf("body is not the branded error page")
+	}
+	if n := atomic.LoadInt32(posts); n != 1 {
+		t.Errorf("mas saw %d POSTs, want exactly 1 (no retry when off)", n)
+	}
+	if got := rec.Header().Get("Stale"); got != "" {
+		t.Errorf("Stale header = %q when off, want unset", got)
+	}
+}
+
+// TestResolveRetriesUnsentFailure scripts the unsent class at the wire: the
+// first dial to mas is refused, the second reaches a real server. The retry
+// must ride it out (KTD1: unsent is always retryable).
+func TestResolveRetriesUnsentFailure(t *testing.T) {
+	setResilience(t, true)
+	upstream := newUpstream(t)
+
+	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Resolved{UpstreamURL: upstream.URL})
+	})
+
+	// Fail exactly the first dial at the transport level; the rest dial for
+	// real. apiClient carries the tuned transport, whose DialContext we wrap.
+	tr := p.apiClient.Transport.(*http.Transport)
+	baseDial := tr.DialContext
+	// Count only dials to mas: the transport is shared, so the proxied
+	// request to the upstream dials through it too.
+	masAddr := strings.TrimPrefix(p.config.MasBaseURL, "http://")
+	var dials int32
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != masAddr {
+			return baseDial(ctx, network, addr)
+		}
+		if atomic.AddInt32(&dials, 1) == 1 {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused (scripted)")}
+		}
+		return baseDial(ctx, network, addr)
+	}
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after one unsent retry (body: %s)", rec.Code, rec.Body.String())
+	}
+	if n := atomic.LoadInt32(&dials); n != 2 {
+		t.Errorf("dials = %d, want 2", n)
+	}
+	if n := atomic.LoadInt32(posts); n != 1 {
+		t.Errorf("mas saw %d POSTs, want 1 (the refused dial never sent)", n)
+	}
+}
+
+// TestResolveHonoursRetryAfterSeconds: a 503 carrying Retry-After: 1 delays
+// the retry by that second (not the jittered schedule) and then succeeds.
+func TestResolveHonoursRetryAfterSeconds(t *testing.T) {
+	setResilience(t, true)
+	upstream := newUpstream(t)
+
+	var masPosts int32
+	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&masPosts, 1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"detail":"restarting"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Resolved{UpstreamURL: upstream.URL})
+	})
+
+	started := time.Now()
+	rec := servePreview(p, "abc")
+	elapsed := time.Since(started)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if elapsed < time.Second {
+		t.Errorf("retry after %v, want the Retry-After second to be honoured", elapsed)
+	}
+	if n := atomic.LoadInt32(posts); n != 2 {
+		t.Errorf("mas saw %d POSTs, want 2", n)
+	}
+}
+
+// TestResolveRetryAfterLongerThanBudgetEndsExhausted: a Retry-After that
+// cannot fit the remaining budget ends the retry at once (KTD3) - one POST,
+// branded 502, no further attempts.
+func TestResolveRetryAfterLongerThanBudgetEndsExhausted(t *testing.T) {
+	setResilience(t, true)
+
+	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"detail":"restarting"}`)
+	})
+
+	// A caller context with half a second left: 60s of Retry-After cannot fit.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req := previewTestRequest("abc").WithContext(ctx)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if n := atomic.LoadInt32(posts); n != 1 {
+		t.Errorf("mas saw %d POSTs, want exactly 1 (Retry-After ended the retry)", n)
+	}
+}
+
+// TestConcurrentResolvesCollapseToOnePost is the U24 step 7 scenario: 50
+// concurrent requests for one cold preview id produce one resolve POST. All
+// 50 are served from the shared result.
+func TestConcurrentResolvesCollapseToOnePost(t *testing.T) {
+	setResilience(t, true)
+	upstream := newUpstream(t)
+
+	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond) // wide window for the herd
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Resolved{UpstreamURL: upstream.URL})
+	})
+
+	const n = 50
+	var wg sync.WaitGroup
+	results := make([]*httptest.ResponseRecorder, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = servePreview(p, "cold")
+		}(i)
+	}
+	wg.Wait()
+
+	for i, rec := range results {
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200 (body: %s)", i, rec.Code, rec.Body.String())
+		}
+	}
+	if got := atomic.LoadInt32(posts); got != 1 {
+		t.Errorf("mas saw %d POSTs, want exactly 1 for 50 concurrent cold requests", got)
+	}
+}
+
+// TestConcurrentResolvesDoNotCollapseWhenOff pins today's behaviour with the
+// switch off: no collapsing, so the same 50 requests issue 50 POSTs.
+func TestConcurrentResolvesDoNotCollapseWhenOff(t *testing.T) {
+	setResilience(t, false)
+	upstream := newUpstream(t)
+
+	p, posts := newScriptedProxy(t, false, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Resolved{UpstreamURL: upstream.URL})
+	})
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := servePreview(p, "cold")
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200", rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(posts); got != n {
+		t.Errorf("mas saw %d POSTs, want %d (no collapsing when off)", got, n)
+	}
+}
+
+// TestStaleResolutionServedWithinWindow is the U24 step 7 scenario: mas is
+// down and the cached resolution is 30s past its TTL. The request is served
+// - from the stale shelf, marked with a Stale header.
+func TestStaleResolutionServedWithinWindow(t *testing.T) {
+	upstream := newUpstream(t)
+	p := newDeadMasProxy(t, true)
+
+	// A resolution whose TTL ran out 30s ago, with no live cache entry.
+	p.stale.record("abc", &Resolved{UpstreamURL: upstream.URL}, -30*time.Second)
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 served stale (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "upstream ok" {
+		t.Errorf("body = %q, want the upstream's", got)
+	}
+	if got := rec.Header().Get("Stale"); got != "true" {
+		t.Errorf("Stale header = %q, want %q", got, "true")
+	}
+}
+
+// TestStaleResolutionPastWindowIs502 is the other half of the scenario: at
+// 90s past TTL - beyond the 60s stale-if-error window - the same outage
+// answers 502, so a revoked preview cannot linger indefinitely.
+func TestStaleResolutionPastWindowIs502(t *testing.T) {
+	upstream := newUpstream(t)
+	p := newDeadMasProxy(t, true)
+
+	p.stale.record("abc", &Resolved{UpstreamURL: upstream.URL}, -90*time.Second)
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 past the stale window", rec.Code)
+	}
+	if got := rec.Header().Get("Stale"); got != "" {
+		t.Errorf("Stale header = %q, want unset", got)
+	}
+}
+
+// TestStaleIsNotServedWhenOff pins today's behaviour: with the switch off a
+// cache miss plus an unreachable mas is a 502, shelf or no shelf (the shelf
+// does not even exist when off).
+func TestStaleIsNotServedWhenOff(t *testing.T) {
+	upstream := newUpstream(t)
+	p := newDeadMasProxy(t, false)
+
+	if p.stale != nil {
+		t.Fatal("stale shelf built with the switch off")
+	}
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (today's behaviour)", rec.Code)
+	}
+	_ = upstream
+}
+
+// TestNegativeCacheFor404And410: 404 and 410 answers are cached for
+// negativeCacheTTL, so a burst of requests for a dead id costs one POST.
+func TestNegativeCacheFor404And410(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		t.Run(fmt.Sprintf("status %d", status), func(t *testing.T) {
+			p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				fmt.Fprintf(w, `{"detail":"preview id %s"}`, map[int]string{404: "not found", 410: "expired"}[status])
+			})
+
+			for i := 0; i < 3; i++ {
+				rec := servePreview(p, "gone")
+				if rec.Code != status {
+					t.Fatalf("request %d: status = %d, want %d", i, rec.Code, status)
+				}
+			}
+			if n := atomic.LoadInt32(posts); n != 1 {
+				t.Errorf("mas saw %d POSTs, want 1 (negative-cached)", n)
+			}
+
+			_, exp, found := p.cache.GetWithExpiration(negativeCacheKey("gone"))
+			if !found {
+				t.Fatal("no negative-cache entry")
+			}
+			if ttl := time.Until(exp); ttl <= 0 || ttl > negativeCacheTTL {
+				t.Errorf("negative cache ttl = %v, want in (0, %v]", ttl, negativeCacheTTL)
+			}
+		})
+	}
+}
+
+// TestNegativeCacheOnlyWhenOn: with the switch off, two misses are two POSTs.
+func TestNegativeCacheOnlyWhenOn(t *testing.T) {
+	p, posts := newScriptedProxy(t, false, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"detail":"nope"}`)
+	})
+
+	servePreview(p, "gone")
+	servePreview(p, "gone")
+
+	if n := atomic.LoadInt32(posts); n != 2 {
+		t.Errorf("mas saw %d POSTs, want 2 (no negative cache when off)", n)
+	}
+}
+
+// TestTransportSharedWhenResilienceOn is U24 step 8: one tuned transport -
+// maxIdleConnsPerHost per the contract, bounded idle/response-header/TLS
+// waits - shared by apiClient, the preview proxy and the gateway proxy.
+func TestTransportSharedWhenResilienceOn(t *testing.T) {
+	setResilience(t, true)
+	p := NewProxy(&Config{MasBaseURL: "http://mas.test", PreviewResolveSecret: "s", BaseDomain: "preview.test"})
+
+	shared, ok := p.apiClient.Transport.(*http.Transport)
+	if !ok || shared == nil {
+		t.Fatalf("apiClient transport = %v, want the tuned *http.Transport", p.apiClient.Transport)
+	}
+	if p.proxy.Transport != http.RoundTripper(shared) || p.gateway.Transport != http.RoundTripper(shared) {
+		t.Error("apiClient, proxy and gateway do not share one transport")
+	}
+	if shared.MaxIdleConnsPerHost != maxIdleConnsPerHost {
+		t.Errorf("MaxIdleConnsPerHost = %d, want %d", shared.MaxIdleConnsPerHost, maxIdleConnsPerHost)
+	}
+	if shared.IdleConnTimeout != transportIdleConnTimeout {
+		t.Errorf("IdleConnTimeout = %v, want %v", shared.IdleConnTimeout, transportIdleConnTimeout)
+	}
+	if shared.IdleConnTimeout >= 90*time.Second {
+		t.Errorf("IdleConnTimeout %v is not below the upstream idle timeouts", shared.IdleConnTimeout)
+	}
+	if shared.ResponseHeaderTimeout != transportResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", shared.ResponseHeaderTimeout, transportResponseHeaderTimeout)
+	}
+	if shared.TLSHandshakeTimeout != transportTLSHandshakeTimeout {
+		t.Errorf("TLSHandshakeTimeout = %v, want %v", shared.TLSHandshakeTimeout, transportTLSHandshakeTimeout)
+	}
+}
+
+// TestTransportDefaultWhenOff pins today's behaviour: every client on the
+// default transport (nil), exactly as before U24.
+func TestTransportDefaultWhenOff(t *testing.T) {
+	setResilience(t, false)
+	p := NewProxy(&Config{MasBaseURL: "http://mas.test", PreviewResolveSecret: "s", BaseDomain: "preview.test"})
+
+	if p.apiClient.Transport != nil || p.proxy.Transport != nil || p.gateway.Transport != nil {
+		t.Error("transports set with the switch off; want nil (default) everywhere")
+	}
+}
+
+// TestParseRetryAfter covers both header forms per failure-classes.md.
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	tests := []struct {
+		name   string
+		header string
+		want   time.Duration
+		ok     bool
+	}{
+		{"delay-seconds", "3", 3 * time.Second, true},
+		{"zero seconds", "0", 0, true},
+		{"negative is absent", "-2", 0, false},
+		{"empty is absent", "", 0, false},
+		{"garbage is absent", "soon", 0, false},
+		{"whitespace is trimmed", " 2 ", 2 * time.Second, true},
+		{"http-date", now.Add(5 * time.Second).Format(http.TimeFormat), 5 * time.Second, true},
+		{"http-date in the past clamps to zero", now.Add(-5 * time.Second).Format(http.TimeFormat), 0, true},
+		{"unparseable date is absent", "Wed, 32 Foo 2026 00:00:00 GMT", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseRetryAfter(tt.header, now)
+			if ok != tt.ok || got != tt.want {
+				t.Errorf("parseRetryAfter(%q) = %v, %v; want %v, %v", tt.header, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+// TestClassifyTransportError pins the Go failure-class table for the signals
+// resolve() can actually see.
+func TestClassifyTransportError(t *testing.T) {
+	dialRefused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"dial op error", dialRefused, failureClassUnsent},
+		{"dial op error wrapped in url.Error", &url.Error{Op: "Post", URL: "http://mas", Err: dialRefused}, failureClassUnsent},
+		{"dns failure", &net.DNSError{Err: "no such host", Name: "mas.invalid"}, failureClassUnsent},
+		{"tls handshake timeout", errors.New("net/http: TLS handshake timeout"), failureClassUnsent},
+		{"reset after send", &net.OpError{Op: "read", Net: "tcp", Err: io.EOF}, failureClassAmbiguous},
+		{"body cut", io.ErrUnexpectedEOF, failureClassAmbiguous},
+		{"deadline after send", context.DeadlineExceeded, failureClassAmbiguous},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyTransportError(tt.err); got != tt.want {
+				t.Errorf("classifyTransportError(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestJitteredRetryDelayBounds: full jitter with caps growing exponentially
+// from the 250ms base (KTD3).
+func TestJitteredRetryDelayBounds(t *testing.T) {
+	cases := []struct {
+		attempt int
+		upper   time.Duration
+	}{
+		{1, 250 * time.Millisecond},
+		{2, 500 * time.Millisecond},
+		{99, 2 * time.Second},
+	}
+	for _, c := range cases {
+		for i := 0; i < 200; i++ {
+			d := jitteredRetryDelay(c.attempt)
+			if d < 0 || d >= c.upper {
+				t.Errorf("jitteredRetryDelay(%d) = %v, want [0, %v)", c.attempt, d, c.upper)
+			}
+		}
+	}
+}
+
+// capturingHandler collects slog records so tests can assert the KTD14
+// telemetry without parsing text output.
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r)
+	return nil
+}
+func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestRetryTelemetryEmitted: a mas that always 502s emits one retry_attempt
+// per failed retryable attempt (Warn) and a final retry_exhausted (Error)
+// with the contract's field names (events.md, Go rendering).
+func TestRetryTelemetryEmitted(t *testing.T) {
+	setResilience(t, true)
+
+	p, _ := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"detail":"down"}`)
+	})
+
+	capture := &capturingHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	defer slog.SetDefault(previous)
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+
+	var attempts, exhausted int
+	for _, r := range capture.records {
+		if r.Message != "retry_attempt" && r.Message != "retry_exhausted" {
+			// slog.SetDefault also routes the log package through the
+			// handler; only the retry telemetry is under test here.
+			continue
+		}
+		fields := map[string]slog.Value{}
+		r.Attrs(func(a slog.Attr) bool {
+			fields[a.Key] = a.Value
+			return true
+		})
+		for _, key := range []string{"layer", "op", "attempt", "class", "status", "elapsed_ms", "budget_ms", "error"} {
+			if _, ok := fields[key]; !ok {
+				t.Errorf("%s record missing field %q", r.Message, key)
+			}
+		}
+		switch r.Message {
+		case "retry_attempt":
+			attempts++
+			if r.Level != slog.LevelWarn {
+				t.Errorf("retry_attempt level = %v, want Warn", r.Level)
+			}
+			if _, ok := fields["delay_ms"]; !ok {
+				t.Error("retry_attempt missing delay_ms")
+			}
+			if got := fields["class"].String(); got != failureClassRetryableStatus {
+				t.Errorf("retry_attempt class = %q, want %q", got, failureClassRetryableStatus)
+			}
+			if got := fields["status"].Int64(); got != http.StatusBadGateway {
+				t.Errorf("retry_attempt status = %d, want 502", got)
+			}
+			if got := fields["op"].String(); got != "resolve" {
+				t.Errorf("retry_attempt op = %q, want resolve", got)
+			}
+			if got := fields["layer"].String(); got != "http" {
+				t.Errorf("retry_attempt layer = %q, want http", got)
+			}
+			if got := fields["budget_ms"].Int64(); got != resolveBudget.Milliseconds() {
+				t.Errorf("retry_attempt budget_ms = %d, want %d", got, resolveBudget.Milliseconds())
+			}
+		case "retry_exhausted":
+			exhausted++
+			if r.Level != slog.LevelError {
+				t.Errorf("retry_exhausted level = %v, want Error", r.Level)
+			}
+			if _, ok := fields["delay_ms"]; ok {
+				t.Error("retry_exhausted carries delay_ms; want absent")
+			}
+		}
+	}
+	if attempts != resolveRetries {
+		t.Errorf("retry_attempt records = %d, want %d", attempts, resolveRetries)
+	}
+	if exhausted != 1 {
+		t.Errorf("retry_exhausted records = %d, want 1", exhausted)
+	}
+}
+
+// TestRetryTelemetryNotEmittedWhenOff: no retry loop runs with the switch
+// off, so no retry telemetry exists.
+func TestRetryTelemetryNotEmittedWhenOff(t *testing.T) {
+	p, _ := newScriptedProxy(t, false, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"detail":"down"}`)
+	})
+
+	capture := &capturingHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	defer slog.SetDefault(previous)
+
+	if rec := servePreview(p, "abc"); rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	for _, r := range capture.records {
+		if r.Message == "retry_attempt" || r.Message == "retry_exhausted" {
+			t.Errorf("%s emitted with the switch off; today's behaviour has no retry telemetry", r.Message)
+		}
+	}
+}
+
+// TestStaleServeCoversTimeout: mas accepting but never answering (a timeout,
+// ambiguous per KTD1 and so never retried) still falls inside the
+// stale-if-error window - "does not answer" per budgets.md §2.7.
+func TestStaleServeCoversTimeout(t *testing.T) {
+	setResilience(t, true)
+	upstream := newUpstream(t)
+
+	release := make(chan struct{})
+	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Accept, then never respond. Reading the body lets the server
+		// notice the client hanging up; release unblocks Close regardless.
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(mas.Close)
+	t.Cleanup(func() { close(release) }) // runs before mas.Close (LIFO)
+
+	p := NewProxy(&Config{MasBaseURL: mas.URL, PreviewResolveSecret: "test-secret", BaseDomain: "preview.test"})
+	p.stale.record("abc", &Resolved{UpstreamURL: upstream.URL}, -10*time.Second)
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 served stale while mas hangs (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Stale"); got != "true" {
+		t.Errorf("Stale header = %q, want true", got)
+	}
+}
+
+// TestSingleflightLeaderCancelDoesNotFailFollowers: the first request for a
+// cold id hangs up mid-resolve; the requests sharing that resolve still get
+// the resolution, and only one POST is made.
+func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
+	upstream := newUpstream(t)
+	entered := make(chan struct{}, 1)
+	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Resolved{UpstreamURL: upstream.URL})
+	})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, previewTestRequest("cold").WithContext(leaderCtx))
+		leaderDone <- rec
+	}()
+	<-entered // the leader's POST is in flight at mas
+
+	followerDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { followerDone <- servePreview(p, "cold") }()
+	time.Sleep(20 * time.Millisecond)
+	cancelLeader()
+
+	<-leaderDone
+	rec := <-followerDone
+	if rec.Code != http.StatusOK {
+		t.Fatalf("follower status = %d, want 200 after the leader hung up (body: %s)", rec.Code, rec.Body.String())
+	}
+	if n := atomic.LoadInt32(posts); n != 1 {
+		t.Errorf("mas saw %d POSTs, want 1", n)
+	}
+}
+
+// TestStaleShelfDropsEntriesPastWindow: the shelf does not keep resolutions
+// that can no longer be served, so it stays bounded.
+func TestStaleShelfDropsEntriesPastWindow(t *testing.T) {
+	s := newStaleShelf()
+	s.record("old", &Resolved{UpstreamURL: "http://x"}, -staleIfErrorWindow-time.Second)
+	if s.entries.ItemCount() != 0 {
+		t.Errorf("shelf holds %d entries for a resolution past the window, want 0", s.entries.ItemCount())
+	}
+	s.record("fresh", &Resolved{UpstreamURL: "http://x"}, 45*time.Second)
+	_, exp, found := s.entries.GetWithExpiration("fresh")
+	if !found {
+		t.Fatal("fresh resolution not on the shelf")
+	}
+	if want := 45*time.Second + staleIfErrorWindow; time.Until(exp) > want || time.Until(exp) < want-time.Second {
+		t.Errorf("shelf expiry in %v, want ~%v", time.Until(exp), want)
 	}
 }
