@@ -5,8 +5,14 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
+	"math"
+	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -51,6 +58,19 @@ type Proxy struct {
 	cache     *cache.Cache
 	apiClient *http.Client
 	config    *Config
+
+	// ENG-1504 connection-resilience (U24 steps 7–8), gated by
+	// PROXY_RESILIENCE (go/resilience.go). resilience is read once at
+	// construction; off leaves resolve() a single POST per cache miss on
+	// the default transport, byte for byte today's behaviour.
+	resilience bool
+	// inflight collapses concurrent resolves for one preview id into a
+	// single POST (U24 step 7). Only used when resilience is on.
+	inflight *resolveInflight
+	// stale holds the last good resolution past its TTL so a refresh that
+	// fails (mas 5xx or no answer) can still serve it for
+	// staleIfErrorWindow (budgets.md §2.7). Only used when resilience is on.
+	stale *staleShelf
 }
 
 var previewIDRegex = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
@@ -190,6 +210,21 @@ func NewProxy(config *Config) *Proxy {
 		},
 	}
 
+	// ENG-1504 U24 steps 7–8: PROXY_RESILIENCE gates the resolve retry
+	// loop, the per-id singleflight, the stale-if-error shelf, the negative
+	// cache and one tuned transport shared by all three clients. Off — the
+	// default — builds none of it, so every client stays on the default
+	// transport and resolve() is exactly today's one POST per cache miss.
+	if resilienceEnabled() {
+		p.resilience = true
+		p.inflight = newResolveInflight()
+		p.stale = newStaleShelf()
+		transport := newResilientTransport()
+		p.apiClient.Transport = transport
+		p.proxy.Transport = transport
+		p.gateway.Transport = transport
+	}
+
 	return p
 }
 
@@ -235,7 +270,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolve up front so we can map mas errors (404/410) to the correct
 	// status on the branded error page. Upstream/proxy failures after this
 	// point stay 502 (handled by ModifyResponse/ErrorHandler).
-	resolved, err := p.resolve(r.Context(), previewID)
+	resolved, staleServed, err := p.resolveWithStale(r.Context(), previewID)
 	if err != nil {
 		if rerr, ok := err.(*resolveError); ok && (rerr.status == http.StatusNotFound || rerr.status == http.StatusGone) {
 			log.Printf("previewId %s unresolvable: %v", previewID, err)
@@ -245,6 +280,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to resolve previewId %s: %v", previewID, err)
 		p.writeErrorPage(w, http.StatusBadGateway)
 		return
+	}
+
+	if staleServed {
+		// The last good resolution, past its TTL, served because mas
+		// answered 5xx or did not answer (PROXY_RESILIENCE, U24 step 7).
+		w.Header().Set("Stale", "true")
 	}
 
 	ctx := context.WithValue(r.Context(), resolvedContextKey, resolved)
@@ -446,28 +487,65 @@ func isInterfaceLabel(label string) bool {
 // resolve calls mas's POST /internal/preview/resolve to turn an opaque
 // previewId into an upstream URL + auth token/header, provider-agnostically
 // (Daytona and e2b both flow through this). Results are cached by previewId.
+//
+// With PROXY_RESILIENCE on, resolve additionally retries unsent failures and
+// 502/503/504, collapses concurrent resolves per id into one POST, serves the
+// last good resolution for staleIfErrorWindow past its TTL while mas answers
+// 5xx or does not answer, and negative-caches 404/410 for negativeCacheTTL
+// (U24 step 7, budgets.md §2.7). The Interfaces gateway path never goes
+// through this: its bodies cannot be replayed, so it is never retried.
 func (p *Proxy) resolve(ctx context.Context, previewID string) (*Resolved, error) {
+	resolved, _, err := p.resolveWithStale(ctx, previewID)
+	return resolved, err
+}
+
+// resolveWithStale is resolve(), additionally reporting whether the
+// resolution it returned came from the stale-if-error shelf.
+func (p *Proxy) resolveWithStale(ctx context.Context, previewID string) (*Resolved, bool, error) {
 	if x, found := p.cache.Get(previewID); found {
-		return x.(*Resolved), nil
+		return x.(*Resolved), false, nil
 	}
 
+	if !p.resilience {
+		resolved, err := p.resolveOnce(ctx, previewID)
+		return resolved, false, err
+	}
+
+	// Negative cache (budgets.md §2.7): mas answered 404/410 for this id
+	// within negativeCacheTTL, so serve that answer rather than POST again.
+	if status, found := p.cache.Get(negativeCacheKey(previewID)); found {
+		return nil, false, &resolveError{status: status.(int)}
+	}
+
+	return p.inflight.do(ctx, previewID, func(ctx context.Context) (*Resolved, bool, error) {
+		// Re-check both caches: a caller that missed them may arrive just
+		// after another resolve filled them and left the inflight map.
+		if x, found := p.cache.Get(previewID); found {
+			return x.(*Resolved), false, nil
+		}
+		if status, found := p.cache.Get(negativeCacheKey(previewID)); found {
+			return nil, false, &resolveError{status: status.(int)}
+		}
+		return p.resolveResilient(ctx, previewID)
+	})
+}
+
+// resolveOnce is today's resolve: one POST per cache miss, no retry, on
+// whatever transport apiClient carries. PROXY_RESILIENCE off runs exactly this.
+func (p *Proxy) resolveOnce(ctx context.Context, previewID string) (*Resolved, error) {
 	// Bound the resolve call independently of the server's write deadline.
 	// http.Server.WriteTimeout (when set) covers the entire handler -
 	// resolve + the reverse-proxy round trip + response streaming - so a
 	// slow sandbox-wake resolve could otherwise eat the whole budget and
 	// truncate the real proxy response. 15s is comfortably enough for a
 	// wake without risking that.
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, resolveBudget)
 	defer cancel()
 
-	body, _ := json.Marshal(map[string]string{"preview_id": previewID})
-	reqUrl := strings.TrimRight(p.config.MasBaseURL, "/") + "/internal/preview/resolve"
-	req, err := http.NewRequestWithContext(ctx, "POST", reqUrl, bytes.NewReader(body))
+	req, err := p.buildResolveRequest(ctx, previewID)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Internal-Secret", p.config.PreviewResolveSecret)
 
 	resp, err := p.apiClient.Do(req)
 	if err != nil {
@@ -484,17 +562,455 @@ func (p *Proxy) resolve(ctx context.Context, previewID string) (*Resolved, error
 		return nil, err
 	}
 
-	// Honor mas's cache_ttl_s so an expired/revoked preview stops resolving
-	// within that window instead of lingering for a fixed 2-minute default.
-	ttl := time.Duration(r.CacheTTLS) * time.Second
+	p.cache.Set(previewID, &r, resolveCacheTTL(r.CacheTTLS))
+	return &r, nil
+}
+
+// resolveBudget is the wall-clock budget every resolve attempt sequence runs
+// under (budgets.md §2.7: retries happen "inside the existing 15 s context").
+const resolveBudget = 15 * time.Second
+
+// resolveResilient is the PROXY_RESILIENCE resolve path (U24 step 7): retry
+// unsent failures and 502/503/504 at most resolveRetries times inside the 15s
+// budget, negative-cache 404/410, and fall back to the stale shelf when mas
+// answers 5xx or does not answer.
+func (p *Proxy) resolveResilient(ctx context.Context, previewID string) (*Resolved, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, resolveBudget)
+	defer cancel()
+
+	started := time.Now()
+	for attempt := 1; ; attempt++ {
+		// Build a fresh request and body for each permitted resolve attempt.
+		req, err := p.buildResolveRequest(ctx, previewID)
+		if err != nil {
+			return nil, false, err
+		}
+
+		resp, err := p.apiClient.Do(req)
+		if err != nil {
+			class := classifyTransportError(err)
+			if class == failureClassUnsent && attempt <= resolveRetries {
+				if delay, ok := resolveRetryDelay(ctx, nil, attempt); ok && sleepForRetry(ctx, delay) {
+					logRetryAttempt(attempt, class, 0, started, err, delay)
+					continue
+				}
+			}
+			if class == failureClassUnsent {
+				logRetryExhausted(attempt, class, 0, started, err)
+			}
+			// Any transport failure is "mas did not answer" for the purposes
+			// of the stale-if-error window (budgets.md §2.7).
+			return p.serveStaleOrError(previewID, err)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				// A timeout or interrupted HTTP body qualifies for stale
+				// fallback. A fully received but invalid JSON body does not.
+				return p.serveStaleOrError(previewID, err)
+			}
+			var r Resolved
+			if err := json.Unmarshal(body, &r); err != nil {
+				return nil, false, err
+			}
+			ttl := resolveCacheTTL(r.CacheTTLS)
+			p.cache.Set(previewID, &r, ttl)
+			p.stale.record(previewID, &r, ttl)
+			return &r, false, nil
+		}
+
+		// Not 200: drain and close so the connection can be reused by the
+		// next attempt.
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+			// Authoritative: the preview id is gone. Negative-cache the
+			// answer instead of retrying or serving stale.
+			// The stale resolution is forgotten too, so a later outage
+			// cannot reopen a preview mas has revoked.
+			p.cache.Set(negativeCacheKey(previewID), resp.StatusCode, negativeCacheTTL)
+			p.stale.forget(previewID)
+			return nil, false, &resolveError{status: resp.StatusCode}
+		}
+
+		rerr := &resolveError{status: resp.StatusCode}
+		if isRetryableResolveStatus(resp.StatusCode) {
+			if attempt <= resolveRetries {
+				if delay, ok := resolveRetryDelay(ctx, resp, attempt); ok && sleepForRetry(ctx, delay) {
+					logRetryAttempt(attempt, failureClassRetryableStatus, resp.StatusCode, started, rerr, delay)
+					continue
+				}
+			}
+			logRetryExhausted(attempt, failureClassRetryableStatus, resp.StatusCode, started, rerr)
+			return p.serveStaleOrError(previewID, rerr)
+		}
+
+		if resp.StatusCode >= 500 {
+			// 5xx outside the frozen retry list (500, 520-524): budgets.md
+			// §2.7 lets resolve retry only 502, 503 and 504, so this fails
+			// without retry - but it is still mas in trouble, so the
+			// stale-if-error window applies.
+			return p.serveStaleOrError(previewID, rerr)
+		}
+
+		// Other 4xx: mas answered authoritatively and refused. Permanent, no
+		// retry, and the stale resolution is forgotten.
+		p.stale.forget(previewID)
+		return nil, false, rerr
+	}
+}
+
+// serveStaleOrError answers a failed refresh from the stale shelf when the
+// last good resolution is within staleIfErrorWindow past its TTL, else with
+// the failure itself.
+func (p *Proxy) serveStaleOrError(previewID string, err error) (*Resolved, bool, error) {
+	if r, ok := p.stale.serve(previewID); ok {
+		return r, true, nil
+	}
+	return nil, false, err
+}
+
+// buildResolveRequest builds the POST /internal/preview/resolve request. A
+// fresh one is built per attempt so a retry replays the body exactly.
+func (p *Proxy) buildResolveRequest(ctx context.Context, previewID string) (*http.Request, error) {
+	body, _ := json.Marshal(map[string]string{"preview_id": previewID})
+	reqUrl := strings.TrimRight(p.config.MasBaseURL, "/") + "/internal/preview/resolve"
+	req, err := http.NewRequestWithContext(ctx, "POST", reqUrl, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Secret", p.config.PreviewResolveSecret)
+	return req, nil
+}
+
+// resolveCacheTTL maps mas's cache_ttl_s to the proxy-side cache TTL: mas's
+// value when usable, defaultResolveCacheTTL when not, capped at
+// maxResolveCacheTTL so a bad value cannot keep a closed preview reachable.
+func resolveCacheTTL(cacheTTLS int) time.Duration {
+	ttl := time.Duration(cacheTTLS) * time.Second
 	if ttl <= 0 {
 		ttl = defaultResolveCacheTTL
 	}
 	if ttl > maxResolveCacheTTL {
 		ttl = maxResolveCacheTTL
 	}
-	p.cache.Set(previewID, &r, ttl)
-	return &r, nil
+	return ttl
+}
+
+// negativeCacheKey namespaces a negative-cache entry inside the same go-cache
+// as positive resolutions. \x00 cannot appear in a preview id
+// (previewIDRegex is [a-zA-Z0-9]+), so the keys cannot collide.
+func negativeCacheKey(previewID string) string {
+	return previewID + "\x00neg"
+}
+
+// isRetryableResolveStatus is budgets.md §2.7's frozen retry list for
+// resolve(): 502, 503 and 504 only.
+func isRetryableResolveStatus(status int) bool {
+	return status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
+}
+
+// Failure classes as spelled by the contract (failure-classes.md).
+const (
+	failureClassUnsent          = "unsent"
+	failureClassAmbiguous       = "ambiguous"
+	failureClassRetryableStatus = "retryable_status"
+	failureClassPermanent       = "permanent"
+)
+
+// classifyTransportError sorts a transport error from apiClient.Do into the
+// contract's failure classes (failure-classes.md, Go table). Only unsent
+// failures are retried by resolveResilient: the request never reached mas, so
+// replaying it cannot duplicate anything. Everything else is ambiguous at
+// this layer and fails without retry - the stale-if-error shelf still covers
+// the caller.
+func classifyTransportError(err error) string {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return failureClassUnsent
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return failureClassUnsent
+	}
+	// Go has no exported sentinel for a TLS handshake timeout; net/http
+	// reports it as an error whose text carries "TLS handshake timeout"
+	// (failure-classes.md lists it under unsent, so detect it best-effort).
+	if strings.Contains(err.Error(), "TLS handshake timeout") {
+		return failureClassUnsent
+	}
+	return failureClassAmbiguous
+}
+
+// jitteredRetryDelay draws the delay before the next attempt: full jitter
+// (uniform over [0, cap)) with caps growing exponentially from a 250 ms base
+// (KTD3: base 100-250 ms, full jitter on mass-disconnect-class events).
+func jitteredRetryDelay(attempt int) time.Duration {
+	shift := attempt - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 3 {
+		// Cap the growth at 250ms<<3 = 2s; shifting further overflows.
+		shift = 3
+	}
+	upper := 250 * time.Millisecond << shift
+	return time.Duration(rand.Int63n(int64(upper)))
+}
+
+// resolveRetryDelay returns the delay to sleep before retrying, and whether a
+// retry fits the remaining budget at all. A Retry-After on the failing
+// response (either form, parsed per failure-classes.md) overrides the
+// jittered schedule; one that does not fit the remaining budget ends the
+// retry at once, reported as exhausted (KTD3). resp may be nil for transport
+// failures.
+func resolveRetryDelay(ctx context.Context, resp *http.Response, attempt int) (time.Duration, bool) {
+	deadline, hasDeadline := ctx.Deadline()
+	remaining := resolveBudget
+	if hasDeadline {
+		remaining = time.Until(deadline)
+	}
+	if resp != nil {
+		if ra, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+			if ra >= remaining {
+				return 0, false
+			}
+			return ra, true
+		}
+	}
+	delay := jitteredRetryDelay(attempt)
+	if delay >= remaining {
+		return 0, false
+	}
+	return delay, true
+}
+
+// parseRetryAfter parses a Retry-After header in either form (delay-seconds
+// or HTTP-date, failure-classes.md). Non-numeric, negative or unparseable
+// values read as absent; a date in the past clamps to 0.
+func parseRetryAfter(header string, now time.Time) (time.Duration, bool) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(header); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		if uint64(secs) > uint64(math.MaxInt64/int64(time.Second)) {
+			return time.Duration(math.MaxInt64), true
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if _, err := strconv.ParseUint(header, 10, 64); errors.Is(err, strconv.ErrRange) {
+		// An overflowing delay is still longer than the resolve budget.
+		return time.Duration(math.MaxInt64), true
+	}
+	if t, err := http.ParseTime(header); err == nil {
+		d := t.Sub(now)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
+}
+
+// sleepForRetry sleeps for d, aborting as not-ok when the context ends first.
+func sleepForRetry(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// errorTypeName is the error's type name only (events.md §1: `ConnectError`,
+// not the message), unwrapped past *url.Error so it names the cause.
+func errorTypeName(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	return fmt.Sprintf("%T", err)
+}
+
+// logRetryAttempt / logRetryExhausted emit the KTD14 retry telemetry
+// (events.md §3, Go): one slog record per event with the contract's field
+// names. status is 0 when the failure had no HTTP status, logged as null.
+func logRetryAttempt(attempt int, class string, status int, started time.Time, err error, delay time.Duration) {
+	slog.Warn("retry_attempt",
+		"layer", "http",
+		"op", "resolve",
+		"attempt", attempt,
+		"class", class,
+		"status", statusField(status),
+		"elapsed_ms", time.Since(started).Milliseconds(),
+		"budget_ms", resolveBudget.Milliseconds(),
+		"error", errorTypeName(err),
+		"delay_ms", delay.Milliseconds(),
+	)
+}
+
+// statusField renders events.md §1's `status`: the HTTP status, or null
+// when the failure had none.
+func statusField(status int) any {
+	if status == 0 {
+		return nil
+	}
+	return status
+}
+
+func logRetryExhausted(attempt int, class string, status int, started time.Time, err error) {
+	slog.Error("retry_exhausted",
+		"layer", "http",
+		"op", "resolve",
+		"attempt", attempt,
+		"class", class,
+		"status", statusField(status),
+		"elapsed_ms", time.Since(started).Milliseconds(),
+		"budget_ms", resolveBudget.Milliseconds(),
+		"error", errorTypeName(err),
+	)
+}
+
+type staleEntry struct {
+	resolved  *Resolved
+	expiresAt time.Time
+}
+
+// staleShelf holds the last good resolution per preview id together with the
+// moment its cache TTL ran out, so a refresh that fails during
+// staleIfErrorWindow can still serve it. Entries live in their own go-cache
+// that drops them once the window has passed, so the shelf stays bounded by
+// the ids seen in the last TTL + staleIfErrorWindow.
+type staleShelf struct {
+	entries *cache.Cache
+}
+
+func newStaleShelf() *staleShelf {
+	return &staleShelf{entries: cache.New(staleIfErrorWindow, time.Minute)}
+}
+
+// record remembers a fresh resolution together with its cache TTL. A negative
+// ttl places the entry in the past (used by tests to age a resolution past
+// its TTL without sleeping); one already beyond the window is not kept.
+func (s *staleShelf) record(previewID string, r *Resolved, ttl time.Duration) {
+	keep := ttl + staleIfErrorWindow
+	if keep <= 0 {
+		s.entries.Delete(previewID)
+		return
+	}
+	s.entries.Set(previewID, staleEntry{resolved: r, expiresAt: time.Now().Add(ttl)}, keep)
+}
+
+// forget drops the recorded resolution after mas authoritatively refused it.
+func (s *staleShelf) forget(previewID string) {
+	s.entries.Delete(previewID)
+}
+
+// serve returns the recorded resolution when it is no more than
+// staleIfErrorWindow past its TTL.
+func (s *staleShelf) serve(previewID string) (*Resolved, bool) {
+	x, ok := s.entries.Get(previewID)
+	if !ok {
+		return nil, false
+	}
+	e := x.(staleEntry)
+	if time.Since(e.expiresAt) > staleIfErrorWindow {
+		return nil, false
+	}
+	return e.resolved, true
+}
+
+// resolveInflight collapses concurrent resolves for one preview id into a
+// single POST (U24 step 7). Followers wait for and share the leader's result,
+// including its error - the semantics golang.org/x/sync/singleflight would
+// give, hand-rolled to keep the module dependency-free.
+type resolveInflight struct {
+	mu    sync.Mutex
+	calls map[string]*resolveCall
+}
+
+type resolveCall struct {
+	done     chan struct{}
+	resolved *Resolved
+	stale    bool
+	err      error
+}
+
+func newResolveInflight() *resolveInflight {
+	return &resolveInflight{calls: make(map[string]*resolveCall)}
+}
+
+// do runs fn once per preview id at a time. fn runs on a context detached
+// from any single caller's cancellation (it keeps the values and is bounded
+// by resolveBudget inside fn), so one client hanging up does not fail every
+// request waiting on the same resolve. Each caller, leader included, stops
+// waiting when its own context ends.
+func (s *resolveInflight) do(ctx context.Context, previewID string, fn func(context.Context) (*Resolved, bool, error)) (*Resolved, bool, error) {
+	s.mu.Lock()
+	c, ok := s.calls[previewID]
+	if !ok {
+		c = &resolveCall{done: make(chan struct{})}
+		s.calls[previewID] = c
+		go func() {
+			c.resolved, c.stale, c.err = fn(context.WithoutCancel(ctx))
+			s.mu.Lock()
+			delete(s.calls, previewID)
+			s.mu.Unlock()
+			close(c.done)
+		}()
+	}
+	s.mu.Unlock()
+
+	select {
+	case <-c.done:
+		return c.resolved, c.stale, c.err
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+// Transport tuning for the shared transport (budgets.md §2.7 transport row).
+// maxIdleConnsPerHost is frozen by the contract (go/resilience.go). The
+// connect and TLS-handshake budgets mirror the PostgREST connect budget
+// (KTD5). ResponseHeaderTimeout is the track's choice, recorded in the state
+// file: 60s bounds a wait for headers without cutting an SSE stream or any
+// response that has started. Retire idle connections at 4s, below Uvicorn's
+// default 5s keep-alive used by MAS.
+const (
+	transportConnectTimeout        = 5 * time.Second
+	transportTLSHandshakeTimeout   = 5 * time.Second
+	transportResponseHeaderTimeout = 60 * time.Second
+	transportIdleConnTimeout       = 4 * time.Second
+	transportMaxIdleConns          = 256
+)
+
+// newResilientTransport builds the one tuned transport shared by apiClient,
+// p.proxy and p.gateway (U24 step 8), cloned from the default transport so
+// everything not tuned here stays at Go's defaults.
+func newResilientTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: transportConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = transportTLSHandshakeTimeout
+	t.MaxIdleConns = transportMaxIdleConns
+	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	t.IdleConnTimeout = transportIdleConnTimeout
+	t.ResponseHeaderTimeout = transportResponseHeaderTimeout
+	return t
 }
 
 func loadConfig() *Config {
