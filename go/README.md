@@ -122,7 +122,7 @@ overwriting what a client sent, so the two settings have to move together.
 To run the proxy server, execute the following command in the project root:
 
 ```sh
-go run main.go
+go run .
 ```
 
 The server will start on the port specified in your `.env` file (or default
