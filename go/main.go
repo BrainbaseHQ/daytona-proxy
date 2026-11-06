@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -517,6 +518,14 @@ func (p *Proxy) resolveWithStale(ctx context.Context, previewID string) (*Resolv
 	}
 
 	return p.inflight.do(ctx, previewID, func(ctx context.Context) (*Resolved, bool, error) {
+		// Re-check both caches: a caller that missed them may arrive just
+		// after another resolve filled them and left the inflight map.
+		if x, found := p.cache.Get(previewID); found {
+			return x.(*Resolved), false, nil
+		}
+		if status, found := p.cache.Get(negativeCacheKey(previewID)); found {
+			return nil, false, &resolveError{status: status.(int)}
+		}
 		return p.resolveResilient(ctx, previewID)
 	})
 }
@@ -571,8 +580,7 @@ func (p *Proxy) resolveResilient(ctx context.Context, previewID string) (*Resolv
 
 	started := time.Now()
 	for attempt := 1; ; attempt++ {
-		// A fresh request per attempt: a bytes.Reader body cannot be
-		// replayed, and the retry decision must not depend on drain state.
+		// Build a fresh request and body for each permitted resolve attempt.
 		req, err := p.buildResolveRequest(ctx, previewID)
 		if err != nil {
 			return nil, false, err
@@ -596,16 +604,17 @@ func (p *Proxy) resolveResilient(ctx context.Context, previewID string) (*Resolv
 		}
 
 		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				// A timeout or interrupted HTTP body qualifies for stale
+				// fallback. A fully received but invalid JSON body does not.
+				return p.serveStaleOrError(previewID, err)
+			}
 			var r Resolved
-			if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-				resp.Body.Close()
-				// mas answered, but not a resolution we can parse. That is a
-				// protocol failure, not an outage: the contract's stale
-				// window covers "mas answers 5xx or doesn't answer", and this
-				// is neither, so no stale serve.
+			if err := json.Unmarshal(body, &r); err != nil {
 				return nil, false, err
 			}
-			resp.Body.Close()
 			ttl := resolveCacheTTL(r.CacheTTLS)
 			p.cache.Set(previewID, &r, ttl)
 			p.stale.record(previewID, &r, ttl)
@@ -620,7 +629,10 @@ func (p *Proxy) resolveResilient(ctx context.Context, previewID string) (*Resolv
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 			// Authoritative: the preview id is gone. Negative-cache the
 			// answer instead of retrying or serving stale.
+			// The stale resolution is forgotten too, so a later outage
+			// cannot reopen a preview mas has revoked.
 			p.cache.Set(negativeCacheKey(previewID), resp.StatusCode, negativeCacheTTL)
+			p.stale.forget(previewID)
 			return nil, false, &resolveError{status: resp.StatusCode}
 		}
 
@@ -645,7 +657,8 @@ func (p *Proxy) resolveResilient(ctx context.Context, previewID string) (*Resolv
 		}
 
 		// Other 4xx: mas answered authoritatively and refused. Permanent, no
-		// retry, no stale.
+		// retry, and the stale resolution is forgotten.
+		p.stale.forget(previewID)
 		return nil, false, rerr
 	}
 }
@@ -790,7 +803,14 @@ func parseRetryAfter(header string, now time.Time) (time.Duration, bool) {
 		if secs < 0 {
 			return 0, false
 		}
+		if uint64(secs) > uint64(math.MaxInt64/int64(time.Second)) {
+			return time.Duration(math.MaxInt64), true
+		}
 		return time.Duration(secs) * time.Second, true
+	}
+	if _, err := strconv.ParseUint(header, 10, 64); errors.Is(err, strconv.ErrRange) {
+		// An overflowing delay is still longer than the resolve budget.
+		return time.Duration(math.MaxInt64), true
 	}
 	if t, err := http.ParseTime(header); err == nil {
 		d := t.Sub(now)
@@ -896,6 +916,11 @@ func (s *staleShelf) record(previewID string, r *Resolved, ttl time.Duration) {
 	s.entries.Set(previewID, staleEntry{resolved: r, expiresAt: time.Now().Add(ttl)}, keep)
 }
 
+// forget drops the recorded resolution after mas authoritatively refused it.
+func (s *staleShelf) forget(previewID string) {
+	s.entries.Delete(previewID)
+}
+
 // serve returns the recorded resolution when it is no more than
 // staleIfErrorWindow past its TTL.
 func (s *staleShelf) serve(previewID string) (*Resolved, bool) {
@@ -964,13 +989,13 @@ func (s *resolveInflight) do(ctx context.Context, previewID string, fn func(cont
 // connect and TLS-handshake budgets mirror the PostgREST connect budget
 // (KTD5). ResponseHeaderTimeout is the track's choice, recorded in the state
 // file: 60s bounds a wait for headers without cutting an SSE stream or any
-// response that has started, while an idle connection retires at 60s, below
-// the 90s Go keeps them and typical upstream keep-alives.
+// response that has started. Retire idle connections at 4s, below Uvicorn's
+// default 5s keep-alive used by MAS.
 const (
 	transportConnectTimeout        = 5 * time.Second
 	transportTLSHandshakeTimeout   = 5 * time.Second
 	transportResponseHeaderTimeout = 60 * time.Second
-	transportIdleConnTimeout       = 60 * time.Second
+	transportIdleConnTimeout       = 4 * time.Second
 	transportMaxIdleConns          = 256
 )
 

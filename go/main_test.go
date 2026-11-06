@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1031,6 +1033,9 @@ func newScriptedProxy(t *testing.T, on bool, handler http.HandlerFunc) (*Proxy, 
 	setResilience(t, on)
 	var posts int32
 	mas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected mas method: %s", r.Method)
+		}
 		if r.URL.Path != "/internal/preview/resolve" {
 			t.Errorf("unexpected mas path: %s", r.URL.Path)
 		}
@@ -1108,15 +1113,13 @@ func TestResolveRetries502ThenSucceeds(t *testing.T) {
 		return b
 	}
 
-	served := make(chan struct{}, 1)
 	var masPosts int32
 	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
 		if atomic.AddInt32(&masPosts, 1) == 1 {
-			// first POST: 502 in the fixture's error shape
+			// contract/fixtures/daytona-5xx.json, step 1 response verbatim.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			fmt.Fprint(w, `{"error":{"code":"api_error","message":"upstream provider unavailable","status":502}}`)
-			served <- struct{}{}
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1181,13 +1184,14 @@ func TestResolveRetriesUnsentFailure(t *testing.T) {
 	// Count only dials to mas: the transport is shared, so the proxied
 	// request to the upstream dials through it too.
 	masAddr := strings.TrimPrefix(p.config.MasBaseURL, "http://")
+	refusedAddr := strings.TrimPrefix(deadMasURL(t), "http://")
 	var dials int32
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if addr != masAddr {
 			return baseDial(ctx, network, addr)
 		}
 		if atomic.AddInt32(&dials, 1) == 1 {
-			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused (scripted)")}
+			return baseDial(ctx, network, refusedAddr)
 		}
 		return baseDial(ctx, network, addr)
 	}
@@ -1304,14 +1308,23 @@ func TestConcurrentResolvesCollapseToOnePost(t *testing.T) {
 func TestConcurrentResolvesDoNotCollapseWhenOff(t *testing.T) {
 	setResilience(t, false)
 	upstream := newUpstream(t)
+	const n = 50
+	allArrived := make(chan struct{})
+	var arrived int32
 
 	p, posts := newScriptedProxy(t, false, func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(50 * time.Millisecond)
+		if atomic.AddInt32(&arrived, 1) == n {
+			close(allArrived)
+		}
+		select {
+		case <-allArrived:
+		case <-r.Context().Done():
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(Resolved{UpstreamURL: upstream.URL})
 	})
 
-	const n = 50
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -1453,7 +1466,7 @@ func TestTransportSharedWhenResilienceOn(t *testing.T) {
 	if shared.IdleConnTimeout != transportIdleConnTimeout {
 		t.Errorf("IdleConnTimeout = %v, want %v", shared.IdleConnTimeout, transportIdleConnTimeout)
 	}
-	if shared.IdleConnTimeout >= 90*time.Second {
+	if shared.IdleConnTimeout >= 5*time.Second {
 		t.Errorf("IdleConnTimeout %v is not below the upstream idle timeouts", shared.IdleConnTimeout)
 	}
 	if shared.ResponseHeaderTimeout != transportResponseHeaderTimeout {
@@ -1487,6 +1500,8 @@ func TestParseRetryAfter(t *testing.T) {
 	}{
 		{"delay-seconds", "3", 3 * time.Second, true},
 		{"zero seconds", "0", 0, true},
+		{"duration overflow", "9223372036854775807", time.Duration(math.MaxInt64), true},
+		{"integer overflow", "999999999999999999999999999999", time.Duration(math.MaxInt64), true},
 		{"negative is absent", "-2", 0, false},
 		{"empty is absent", "", 0, false},
 		{"garbage is absent", "soon", 0, false},
@@ -1756,5 +1771,182 @@ func TestStaleShelfDropsEntriesPastWindow(t *testing.T) {
 	}
 	if want := 45*time.Second + staleIfErrorWindow; time.Until(exp) > want || time.Until(exp) < want-time.Second {
 		t.Errorf("shelf expiry in %v, want ~%v", time.Until(exp), want)
+	}
+}
+
+// TestRevokedPreviewNotReopenedByStale: once mas answers 410 for an id, a
+// later outage inside the stale window must not serve the old resolution.
+func TestRevokedPreviewNotReopenedByStale(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone, http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			upstream := newUpstream(t)
+			var mode int32 // 0 = authoritative refusal, 1 = 503
+			p, _ := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+				if atomic.LoadInt32(&mode) == 0 {
+					w.WriteHeader(status)
+					return
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+			})
+			p.stale.record("abc", &Resolved{UpstreamURL: upstream.URL}, -5*time.Second)
+
+			if _, _, err := p.resolveWithStale(context.Background(), "abc"); err == nil {
+				t.Fatal("expected authoritative refusal")
+			}
+			p.cache.Delete(negativeCacheKey("abc")) // the 10 s negative cache ran out
+			atomic.StoreInt32(&mode, 1)
+
+			rec := servePreview(p, "abc")
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502: a revoked preview must not be served stale", rec.Code)
+			}
+			if rec.Header().Get("Stale") != "" {
+				t.Error("Stale header set for a revoked preview")
+			}
+		})
+	}
+}
+
+// TestStaleServedWhenResolveBodyDrops: mas sends 200 headers then drops the
+// connection mid-body. That is "mas did not answer", so stale is served.
+func TestStaleServedWhenResolveBodyDrops(t *testing.T) {
+	upstream := newUpstream(t)
+	p, _ := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "500")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"upstream_url":"`)
+		w.(http.Flusher).Flush()
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		conn.Close()
+	})
+	p.stale.record("abc", &Resolved{UpstreamURL: upstream.URL}, -5*time.Second)
+
+	rec := servePreview(p, "abc")
+	if rec.Code != http.StatusOK || rec.Header().Get("Stale") != "true" {
+		t.Fatalf("status = %d Stale = %q, want 200 served stale", rec.Code, rec.Header().Get("Stale"))
+	}
+}
+
+// TestMalformedResolveBodyIsNotServedStale: a 200 with unparseable JSON is a
+// protocol failure, not an outage, so the stale shelf is not used.
+func TestMalformedResolveBodyIsNotServedStale(t *testing.T) {
+	for _, body := range []string{`not json`, `{"upstream_url":"`, `{"upstream_url":42}`, ``} {
+		t.Run(body, func(t *testing.T) {
+			upstream := newUpstream(t)
+			p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, body)
+			})
+			p.stale.record("abc", &Resolved{UpstreamURL: upstream.URL}, -5*time.Second)
+
+			if rec := servePreview(p, "abc"); rec.Code != http.StatusBadGateway || rec.Header().Get("Stale") != "" {
+				t.Fatalf("status = %d Stale = %q, want 502 without stale", rec.Code, rec.Header().Get("Stale"))
+			}
+			if got := atomic.LoadInt32(posts); got != 1 {
+				t.Fatalf("malformed response retried: %d POSTs", got)
+			}
+		})
+	}
+}
+
+func TestStaleServedWhenResolveBodyTimesOut(t *testing.T) {
+	upstream := newUpstream(t)
+	p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Length", "500")
+		fmt.Fprint(w, `{"upstream_url":"`)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	})
+	p.apiClient.Timeout = 200 * time.Millisecond
+	p.stale.record("abc", &Resolved{UpstreamURL: upstream.URL}, -5*time.Second)
+	if rec := servePreview(p, "abc"); rec.Code != http.StatusOK || rec.Header().Get("Stale") != "true" {
+		t.Fatalf("status = %d Stale = %q, want 200 served stale", rec.Code, rec.Header().Get("Stale"))
+	}
+	if got := atomic.LoadInt32(posts); got != 1 {
+		t.Fatalf("body timeout retried: %d POSTs", got)
+	}
+}
+
+func TestResilienceGateValues(t *testing.T) {
+	for _, value := range []string{"1", "true", "on", "TRUE", "On", "", "0", "false", "off", "garbage"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("PROXY_RESILIENCE", value)
+			p := NewProxy(&Config{})
+			want := value == "1" || strings.EqualFold(value, "true") || strings.EqualFold(value, "on")
+			if p.resilience != want || (p.inflight != nil) != want || (p.stale != nil) != want {
+				t.Fatalf("gate %q: resilience state does not match %v", value, want)
+			}
+			if (p.apiClient.Transport != nil) != want || (p.proxy.Transport != nil) != want || (p.gateway.Transport != nil) != want {
+				t.Fatalf("gate %q: transport state does not match %v", value, want)
+			}
+		})
+	}
+}
+
+func TestGateway502NeverReplaysBody(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		t.Run(strconv.FormatBool(on), func(t *testing.T) {
+			p, posts := newScriptedProxy(t, on, func(w http.ResponseWriter, r *http.Request) {
+				t.Error("gateway request reached preview resolve")
+			})
+			var arrivals int32
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&arrivals, 1)
+				body, err := io.ReadAll(r.Body)
+				if err != nil || r.Method != http.MethodPost || string(body) != "non-idempotent-write" {
+					t.Errorf("gateway received method %s body %q error %v", r.Method, body, err)
+				}
+				w.WriteHeader(http.StatusBadGateway)
+				fmt.Fprint(w, "gateway failure")
+			}))
+			defer gateway.Close()
+			p.config.InterfacesGatewayURL, _ = url.Parse(gateway.URL)
+			request := httptest.NewRequest(http.MethodPost, "http://my-app.preview.test/write", strings.NewReader("non-idempotent-write"))
+			recorder := httptest.NewRecorder()
+			p.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadGateway || recorder.Body.String() != "gateway failure" {
+				t.Fatalf("gateway response changed: %d %q", recorder.Code, recorder.Body.String())
+			}
+			if got := atomic.LoadInt32(&arrivals); got != 1 || atomic.LoadInt32(posts) != 0 {
+				t.Fatalf("gateway arrivals = %d, MAS arrivals = %d", got, atomic.LoadInt32(posts))
+			}
+		})
+	}
+}
+
+func TestConcurrentFastResolvesReuseCompletedCache(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNotFound, http.StatusGone} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			p, posts := newScriptedProxy(t, true, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				if status == http.StatusOK {
+					json.NewEncoder(w).Encode(Resolved{UpstreamURL: "http://unused.test"})
+				}
+			})
+			const rounds = 20
+			for round := 0; round < rounds; round++ {
+				id := "burst" + strconv.Itoa(round)
+				start := make(chan struct{})
+				var group sync.WaitGroup
+				for i := 0; i < 50; i++ {
+					group.Add(1)
+					go func() {
+						defer group.Done()
+						<-start
+						_, err := p.resolve(context.Background(), id)
+						if (err == nil) != (status == http.StatusOK) {
+							t.Errorf("resolve returned unexpected error: %v", err)
+						}
+					}()
+				}
+				close(start)
+				group.Wait()
+			}
+			if got := atomic.LoadInt32(posts); got != rounds {
+				t.Fatalf("%d POSTs for %d ids: delayed callers missed completed cache", got, rounds)
+			}
+		})
 	}
 }
